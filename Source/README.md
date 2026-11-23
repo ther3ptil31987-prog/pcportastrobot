@@ -1,9 +1,10 @@
 # Source of the files in the AstroHybrid download
 
 AstroHybrid's binaries are built from two GPL-2.0 projects plus this repository. This page lists, for
-every program file in the download, the exact public base it starts from and the complete patch series
-that turns that base into the source it was built from. Both series are verified to reproduce that
-source tree exactly (same Git tree hash).
+every program file in the download, the exact public base it starts from and the patch series used to
+build it. The original release provenance is recorded below. The canonical AnyPS5 series now also
+contains two ZAR compatibility patches; these require rebuilding the runtime and are not supplied by
+rerunning game setup with an older download. See [the ZAR guide](../Docs/ZAR.md).
 
 | File in the download | Built from |
 |---|---|
@@ -47,18 +48,48 @@ Build (Windows, Visual Studio 2022 Build Tools x64 environment, LLVM 22.1.3 clan
 ## AnyPS5 system libraries and relinker
 
 Base: https://github.com/boykopovar/AnyPS5, commit `319621ba2e578bd053b0baba2877fe70520e0737` (on `main`).
+The original download used patches 0001–0027. Build the current runtime with all 29 patches in
+`Source/anyps5`, including:
+
+- `0028-fix-app0-archive-odx-fallback.patch`: root-relative archive lookup and exact-first `.odxb` fallback.
+- `0029-feat-libc-archive-stdio-streams.patch`: read-only libc archive streams and regression tests.
 
 ```
 git clone https://github.com/boykopovar/AnyPS5.git anyps5
 cd anyps5
-git checkout 319621ba2e578bd053b0baba2877fe70520e0737
+git checkout -b astrobot-zar 319621ba2e578bd053b0baba2877fe70520e0737
 git submodule update --init --recursive
 git am --keep-cr <this repo>/Source/anyps5/*.patch
-git rev-parse HEAD^{tree}     # ab2ee4b0a73ddbf827549df90aff62fa64b35e0c
+git rev-parse HEAD^{tree}
 ```
+
+Apply patches in filename order. `Tools/build.ps1` uses this canonical series, not the older
+`Source/patches` subset. The build script fetches sources directly from public GitHub.
 
 Build with WinLibs GCC 15.2.0 (posix-seh UCRT) as `Tools/build.ps1` does: configure with Ninja in
 Release, build everything and the `libs` target. `core/relinker/relinker.exe` is the relinker; the
 `libs` target produces the `.prx` system libraries, `libAstroHybridHost.prx` is shipped as
 `astrohybrid_host.dll`. `Tools/hybrid/make_run_hybrid.py` shows how the game folder is laid out.
-The older `Source/patches` folder holds the same 26 changes under their earlier names.
+The older `Source/patches` folder holds a historical 26-patch subset; it does not include the new ZAR fixes.
+
+Focused regression tests after a configured build:
+
+```
+ctest --test-dir Build/anyps5 -R "app_archive|archive_stdio" --output-on-failure
+python -m unittest discover -s Tests -p "test_zar_layout.py" -v
+```
+
+For a focused Linux build using actual libc/kernel implementations, GCC 13+ and system `libzstd`:
+
+```
+python3 Tests/run_zar_native.py
+python3 Tests/run_zar_native.py --zarchive-source ../ZArchive-master --work-dir work/zar-native-supplied
+```
+
+This runner does not stub archive or stdio behavior. It runs lookup, stdio and kernel regressions
+against either the pinned dependency or the supplied ZArchive checkout. It omits the kernel `mmap`
+mode on Linux: that mode tests an explicit refusal using the guest terminate handler, but the
+standalone native exception bridge aborts instead of reaching that handler. The original CTest
+mode remains available in the full runtime build; it has not been validated here.
+
+A full Windows build and a game smoke test remain necessary to validate the deployed libraries.

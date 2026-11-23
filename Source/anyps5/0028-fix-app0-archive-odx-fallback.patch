@@ -1,0 +1,278 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude Code <noreply@anthropic.com>
+Date: Sun, 22 Nov 2026 00:00:00 +0000
+Subject: [PATCH 28/29] fix(libc): resolve archived app0 odx files exactly first
+
+Keep /app0 paths relative to the archive root. Report an accidentally
+wrapped app0/ directory instead of silently accepting the wrong layout.
+
+Retry only a missing terminal .odx name as .odxb in AppArchiveLookup,
+using ZArchive-compatible ASCII case folding and accepting regular files
+only. Preserve exact archive entries, native overrides and directory
+names; do not change generic resolver refusal or conversion flags.
+
+Exercise root-relative param.sfx, exact-first binary asset selection,
+selected sizes and bytes, native shadows, unchanged unrelated paths,
+normal listings and checked damaged-block reads with real writer fixtures.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ core/libs/prx/libc/src/AppArchive.cpp  | 47 ++++++++++++++---
+ core/libs/tests/AppArchiveFixture.hpp |  2 +-
+ core/libs/tests/GuestAppArchive.cpp   | 96 +++++++++++++++++++++++++++++++++++--
+ 3 files changed, 134 insertions(+), 11 deletions(-)
+
+diff --git a/core/libs/prx/libc/src/AppArchive.cpp b/core/libs/prx/libc/src/AppArchive.cpp
+index 8195fed12f..fa081d1b56 100644
+--- a/core/libs/prx/libc/src/AppArchive.cpp
++++ b/core/libs/prx/libc/src/AppArchive.cpp
+@@ -42,8 +42,16 @@ Archive& Opened() {
+     candidate += ".zar";
+     std::error_code error;
+     if (std::filesystem::is_regular_file(candidate, error)) {
+-        archive.reader.reset(ZArchiveReader::OpenFromFile(candidate));
+-        if (!archive.reader) throw std::runtime_error("app0.zar is not a readable ZArchive: " + candidate.string());
++        std::unique_ptr<ZArchiveReader> reader(ZArchiveReader::OpenFromFile(candidate));
++        if (!reader) throw std::runtime_error("app0.zar is not a readable ZArchive: " + candidate.string());
++        const auto root = reader->LookUp("");
++        if (reader->GetDirEntryCount(root) == 1) {
++            ZArchiveReader::DirEntry entry{};
++            if (!reader->GetDirEntry(root, 0, entry)) throw std::runtime_error("app0.zar is damaged: its root directory cannot be read");
++            if (entry.isDirectory && SameComponent(entry.name, "app0"))
++                throw std::runtime_error("app0.zar has a wrapped app0/ root: store app0's contents at the archive root, without an app0/ prefix: " + candidate.string());
++        }
++        archive.reader = std::move(reader);
+         archive.path = candidate;
+     }
+     archive.app0 = app0;
+@@ -69,6 +77,23 @@ bool ArchiveRelative(const Archive& archive, const std::filesystem::path& hostPa
+     return true;
+ }
+
++bool NativeShadows(const std::filesystem::path& path) {
++    std::error_code error;
++    const auto status = std::filesystem::symlink_status(path, error);
++    return std::filesystem::exists(status) || (error && error != std::errc::no_such_file_or_directory);
++}
++
++bool NativeNameShadows(const std::filesystem::path& path) {
++    if (NativeShadows(path)) return true;
++    std::error_code error;
++    std::filesystem::directory_iterator entry(path.parent_path(), error), end;
++    const auto name = path.filename().generic_string();
++    for (; !error && entry != end; entry.increment(error)) {
++        if (SameComponent(entry->path().filename().generic_string(), name)) return true;
++    }
++    return error && error != std::errc::no_such_file_or_directory;
++}
++
+ struct OpenFile {
+     AppArchiveNode node;
+     std::uint64_t position = 0;
+@@ -100,8 +125,18 @@ bool AppArchiveLookup_nid_no_patch(const std::filesystem::path& hostPath, AppArc
+     if (!archive.reader) return false;
+     std::string relative;
+     if (!ArchiveRelative(archive, hostPath, relative)) return false;
+-    const auto handle = archive.reader->LookUp(relative);
+-    if (handle == ZARCHIVE_INVALID_NODE) return false;
++    auto handle = archive.reader->LookUp(relative);
++    if (handle == ZARCHIVE_INVALID_NODE) {
++        constexpr std::string_view suffix = ".odx";
++        if (relative.size() < suffix.size() || !SameComponent(std::string_view(relative).substr(relative.size() - suffix.size()), suffix) ||
++            !hostPath.has_filename() || NativeShadows(hostPath)) return false;
++        relative += 'b';
++        handle = archive.reader->LookUp(relative);
++        if (handle == ZARCHIVE_INVALID_NODE || !archive.reader->IsFile(handle)) return false;
++        auto binaryPath = hostPath;
++        binaryPath += 'b';
++        if (NativeNameShadows(binaryPath)) return false;
++    }
+     node->Handle = handle;
+     node->Directory = archive.reader->IsDirectory(handle);
+     node->Size = node->Directory ? 0 : archive.reader->GetFileSize(handle);
+@@ -190,9 +225,7 @@ std::filesystem::path AppArchivePath_nid_no_patch() {
+ bool AppArchiveOnly_nid_no_patch(const std::filesystem::path& hostPath) {
+     auto& archive = Opened();
+     if (!archive.reader) return false;
+-    std::error_code error;
+-    const auto status = std::filesystem::symlink_status(hostPath, error);
+-    if (std::filesystem::exists(status) || (error && error != std::errc::no_such_file_or_directory)) return false;
++    if (NativeShadows(hostPath)) return false;
+     AppArchiveNode node{};
+     return AppArchiveLookup_nid_no_patch(hostPath, &node);
+ }
+diff --git a/core/libs/tests/AppArchiveFixture.hpp b/core/libs/tests/AppArchiveFixture.hpp
+index 234c647e3c..555f5274fc 100644
+--- a/core/libs/tests/AppArchiveFixture.hpp
++++ b/core/libs/tests/AppArchiveFixture.hpp
+@@ -42,7 +42,7 @@ inline void WriteArchive(const std::filesystem::path& path, const std::map<std::
+     for (const auto& directory : directories) if (!writer.MakeDir(directory.c_str(), true)) std::abort();
+     for (const auto& [name, data] : files) {
+         const auto slash = name.find_last_of('/');
+-        if (slash != std::string::npos) writer.MakeDir(name.substr(0, slash).c_str(), true);
++        if (slash != std::string::npos && !writer.MakeDir(name.substr(0, slash).c_str(), true)) std::abort();
+         if (!writer.StartNewFile(name.c_str())) std::abort();
+         if (!data.empty()) writer.AppendData(data.data(), data.size());
+     }
+diff --git a/core/libs/tests/GuestAppArchive.cpp b/core/libs/tests/GuestAppArchive.cpp
+index 1f865808a5..4978109e97 100644
+--- a/core/libs/tests/GuestAppArchive.cpp
++++ b/core/libs/tests/GuestAppArchive.cpp
+@@ -2,6 +2,8 @@
+ #include "prx/libc/include/AppArchive.hpp"
+ #include "prx/libc/include/General.hpp"
+
++#include <zarchive/zarchivereader.h>
++
+ #include <algorithm>
+ #include <cstdlib>
+ #include <cstring>
+@@ -42,11 +44,78 @@ std::map<std::string, std::vector<char>> Contents() {
+         {"Data/Empty.txt", {}},
+         {"Data/Sub/Deep.txt", {'d', 'e', 'e', 'p'}},
+         {"Readme.TXT", {'r', 'e', 'a', 'd'}},
++        {"param.sfx", {'s', 'f', 'x'}},
++        {"sce_sys/param.sfx", {'s', 'f', 'x'}},
++        {"Assets/icons/hero_respawn_icon_01.odxb", {'b', 'i', 'n', 'a', 'r', 'y'}},
++        {"Assets/Exact.odx", {'o', 'd', 'x'}},
++        {"Assets/Exact.odxb", {'n', 'o', 't', '-', 'e', 'x', 'a', 'c', 't'}},
++        {"Assets/ExactDirectory.odxb", {'f', 'i', 'l', 'e'}},
++        {"Assets/Loose.odxb", {'z', 'a', 'r'}},
++        {"Assets/LooseExact.odx", {'z', 'a', 'r'}},
++        {"Assets/LooseDirectory.odxb", {'z', 'a', 'r'}},
++        {"Assets/BinaryShadow.odxb", {'z', 'a', 'r'}},
++        {"Assets/CaseBinaryShadow.odxb", {'z', 'a', 'r'}},
++        {"Assets/LooseBinary.odxb", {'z', 'a', 'r'}},
++        {"Assets/Intermediate.odxb/Child.bin", {'c'}},
++        {"Assets/Unrelated.txtb", {'t'}},
++        {"Assets/Unrelated.odxb.bin", {'x'}},
++        {"app0/Nested.bin", {'n'}},
+     };
+ }
+
++void OdxResolution(const std::filesystem::path& root) {
++    AppArchiveNode node{}, binary{};
++    Require(Lookup("/app0/param.sfx", node) && !node.Directory && node.Size == 3, "archive-only param.sfx was not found at the archive root");
++    Require(AppArchiveOnly_nid_no_patch(root / "app0/param.sfx"), "param.sfx was not archive-only");
++    char bytes[16]{};
++    Require(AppArchiveRead_nid_no_patch(node.Handle, 0, bytes, sizeof(bytes)) == 3 && std::memcmp(bytes, "sfx", 3) == 0, "param.sfx returned wrong bytes");
++    Require(Lookup("/app0/Assets/icons/hero_respawn_icon_01.odxb", binary), "the binary asset was not found exactly");
++    Require(Lookup("/APP0/assets/ICONS/HERO_RESPAWN_ICON_01.ODX", node) && !node.Directory && node.Handle == binary.Handle && node.Size == 6, "missing .odx did not select the case-insensitive .odxb file and size");
++    Require(AppArchiveRead_nid_no_patch(node.Handle, 0, bytes, sizeof(bytes)) == 6 && std::memcmp(bytes, "binary", 6) == 0, "the .odxb fallback returned wrong bytes");
++    Require(AppArchiveOnly_nid_no_patch(root / "app0/Assets/icons/hero_respawn_icon_01.odx"), "the .odx fallback was not archive-only");
++    Require(GuardRefuses("/app0/Assets/icons/hero_respawn_icon_01.odx"), "the generic resolver stopped refusing an aliased archive file");
++    Require(Lookup("/app0/Assets/Exact.odxb", binary), "the binary version of the exact asset was not found");
++    Require(Lookup("/app0/Assets/exact.ODX", node) && !node.Directory && node.Size == 3 && node.Handle != binary.Handle, "exact .odx did not win over .odxb");
++    Require(AppArchiveRead_nid_no_patch(node.Handle, 0, bytes, sizeof(bytes)) == 3 && std::memcmp(bytes, "odx", 3) == 0, "the exact .odx returned the binary version's bytes");
++    Require(Lookup("/app0/Assets/ExactDirectory.odx", node) && node.Directory && node.Size == 0, "an exact .odx directory was replaced by .odxb");
++    Require(!Lookup("/app0/Assets/Directory.odx", node), "a .odxb directory was aliased as a regular file");
++    Require(!Lookup("/app0/Assets/Intermediate.odx/Child.bin", node), "an intermediate path component was rewritten");
++    Require(!Lookup("/app0/Assets/Unrelated.txt", node), "an unrelated extension was rewritten");
++    Require(!Lookup("/app0/Assets/Unrelated.odx.bin", node), "a non-terminal .odx extension was rewritten");
++    Require(!Lookup("/app0/Assets/icons/hero_respawn_icon_01.odx/", node), "a trailing-slash directory request was aliased to a file");
++    Require(!Lookup("/app0/Assets/icons/hero_respawn_icon_01.odx/child", node), "a child of an aliased file was found");
++    Require(!Lookup("/Assets/icons/hero_respawn_icon_01.odx", node), "a path outside app0 was aliased");
++    Require(!Lookup("/app0x/Assets/icons/hero_respawn_icon_01.odx", node), "a sibling mount was aliased");
++    Require(Lookup("/app0/app0/Nested.bin", node) && node.Size == 1, "a valid nested app0 directory was refused");
++
++    const auto entries = AppArchiveListDirectory_nid_no_patch(root / "app0/Assets/icons");
++    Require(entries.size() == 1 && entries[0].Name == "hero_respawn_icon_01.odxb" && !entries[0].Directory && entries[0].Size == 6, "directory entries exposed an .odx alias");
++    std::filesystem::create_directories(root / "app0/Assets");
++    { std::ofstream file(root / "app0/Assets/Loose.odx"); file << "native"; }
++    { std::ofstream file(root / "app0/Assets/LooseExact.odx"); file << "native exact"; }
++    Require(!Lookup("/app0/Assets/Loose.odx", node), "an aliased archive file shadowed an exact native .odx");
++    Require(!AppArchiveOnly_nid_no_patch(root / "app0/Assets/Loose.odx"), "a loose .odx override was archive-only");
++    Require(!AppArchiveOnly_nid_no_patch(root / "app0/Assets/LooseExact.odx"), "an exact loose file was shadowed by an archive file");
++    Require(ResolvePath_nid_no_patch("/app0/Assets/Loose.odx") == root / "app0/Assets/Loose.odx", "a loose .odx override was refused");
++    Require(ResolvePath_nid_no_patch("/app0/Assets/LooseExact.odx") == root / "app0/Assets/LooseExact.odx", "an exact loose file was refused");
++    std::filesystem::create_directory(root / "app0/Assets/LooseDirectory.odx");
++    Require(!Lookup("/app0/Assets/LooseDirectory.odx", node) && !AppArchiveOnly_nid_no_patch(root / "app0/Assets/LooseDirectory.odx"), "a loose directory became an aliased regular file");
++    std::filesystem::create_directory(root / "app0/Assets/BinaryShadow.odxb");
++    Require(!Lookup("/app0/Assets/BinaryShadow.odx", node), "a shadowed .odxb directory became an aliased regular file");
++    std::filesystem::create_directory(root / "app0/Assets/CaseBinaryShadow.ODXB");
++    Require(!Lookup("/app0/Assets/CaseBinaryShadow.odx", node), "a case-insensitive loose .odxb directory did not shadow the alias");
++    { std::ofstream file(root / "app0/Assets/LooseBinary.odxb"); file << "native binary"; }
++    Require(!Lookup("/app0/Assets/LooseBinary.odx", node), "an archive alias bypassed a loose .odxb override");
++    Require(ResolvePath_nid_no_patch("/app0/Assets/LooseBinary.odxb") == root / "app0/Assets/LooseBinary.odxb", "a loose binary override was refused");
++}
++
+ void Present(const std::filesystem::path& root) {
+-    AppArchiveFixture::WriteArchive(root / "app0.zar", Contents(), {"Data/Unused"});
++    AppArchiveFixture::WriteArchive(root / "app0.zar", Contents(), {"Data/Unused", "Assets/Directory.odxb", "Assets/ExactDirectory.odx"});
++    {
++        std::unique_ptr<ZArchiveReader> reader(ZArchiveReader::OpenFromFile(root / "app0.zar"));
++        Require(reader != nullptr, "the real writer fixture could not be opened");
++        Require(reader->LookUp("param.sfx") != ZARCHIVE_INVALID_NODE && reader->LookUp("app0/param.sfx") == ZARCHIVE_INVALID_NODE && reader->LookUp("sce_sys/param.sfx") != ZARCHIVE_INVALID_NODE && reader->LookUp("app0/sce_sys/param.sfx") == ZARCHIVE_INVALID_NODE, "the fixture accidentally wrapped archive keys in app0/");
++    }
+     { std::ofstream eboot(root / "app0" / "eboot.bin"); eboot << "elf"; }
+     Require(AppArchivePath_nid_no_patch() == root / "app0.zar", "the archive beside app0 was not opened");
+
+@@ -67,7 +136,7 @@ void Present(const std::filesystem::path& root) {
+     Require(GuardRefuses("/app0/Data"), "an archive-only directory resolved through an unaware call");
+     Require(ResolvePath_nid_no_patch("/app0/eboot.bin") == root / "app0" / "eboot.bin", "a file on disk was refused");
+     Require(ResolvePath_nid_no_patch("/app0/Data/Missing.bin") == root / "app0" / "Data" / "Missing.bin", "a path missing everywhere was refused");
+-    Require(Lookup("/app0/sce_sys", node) == false && ResolvePath_nid_no_patch("/app0/sce_sys") == root / "app0" / "sce_sys", "a directory only on disk was not left to the disk");
++    Require(Lookup("/app0/sce_sys", node) && node.Directory && ResolvePath_nid_no_patch("/app0/sce_sys") == root / "app0" / "sce_sys", "a loose directory merged with the archive was not left to the disk");
+
+     bool rejected = false;
+     const auto expected = AppArchiveFixture::Pattern(BigSize);
+@@ -124,6 +193,7 @@ void Present(const std::filesystem::path& root) {
+     rejected = false;
+     try { (void)AppArchiveRead_nid_no_patch(data, 0, buffer.data(), 1); } catch (const std::invalid_argument&) { rejected = true; }
+     Require(rejected, "a directory was read as a file");
++    OdxResolution(root);
+ }
+
+ void Absent() {
+@@ -131,6 +201,10 @@ void Absent() {
+     Require(AppArchivePath_nid_no_patch().empty(), "an archive was reported without app0.zar");
+     Require(!Lookup("/app0/Readme.TXT", node), "a path was found without an archive");
+     Require(ResolvePath_nid_no_patch("/app0/Readme.TXT").filename() == "Readme.TXT", "resolution changed without an archive");
++    std::filesystem::create_directory("app0/Assets");
++    { std::ofstream file("app0/Assets/OnlyLoose.odxb"); file << "native"; }
++    Require(!Lookup("/app0/Assets/OnlyLoose.odx", node), "a loose .odxb was aliased without an archive");
++    Require(ResolvePath_nid_no_patch("/app0/Assets/OnlyLoose.odx").filename() == "OnlyLoose.odx", "a loose .odxb rewrote the native path");
+ }
+
+ void Damaged(const std::filesystem::path& root) {
+@@ -147,6 +221,21 @@ void Damaged(const std::filesystem::path& root) {
+     bool thrown = false;
+     try { (void)AppArchiveRead_nid_no_patch(node.Handle, 0, buffer.data(), buffer.size()); } catch (const std::runtime_error& error) { thrown = std::strstr(error.what(), "damaged") != nullptr; }
+     Require(thrown, "a damaged block did not fail the read");
++    Require(Lookup("/app0/Assets/icons/hero_respawn_icon_01.odx", node), "a binary alias in the damaged archive was not found");
++    thrown = false;
++    try { (void)AppArchiveRead_nid_no_patch(node.Handle, 0, buffer.data(), buffer.size()); } catch (const std::runtime_error& error) { thrown = std::strstr(error.what(), "app0.zar is damaged") != nullptr; }
++    Require(thrown, "a binary alias bypassed the checked damaged-block read");
++}
++
++void Wrapped(const std::filesystem::path& root) {
++    AppArchiveFixture::WriteArchive(root / "app0.zar", {{"APP0/param.sfx", {'s', 'f', 'x'}}});
++    bool thrown = false;
++    try { AppArchiveReady_nid_no_patch(); } catch (const std::runtime_error& error) {
++        thrown = std::strstr(error.what(), "wrapped app0/ root") != nullptr &&
++            std::strstr(error.what(), "without an app0/ prefix") != nullptr &&
++            std::strstr(error.what(), (root / "app0.zar").string().c_str()) != nullptr;
++    }
++    Require(thrown, "an accidentally wrapped app0/ archive did not explain the root-relative layout");
+ }
+
+ void Invalid(const std::filesystem::path& root) {
+@@ -161,7 +250,7 @@ void Invalid(const std::filesystem::path& root) {
+
+ int main(int argc, char** argv) {
+     if (argc != 2) {
+-        std::cerr << "usage: guest_app_archive_tests present|absent|damaged|invalid\n";
++        std::cerr << "usage: guest_app_archive_tests present|absent|damaged|invalid|wrapped\n";
+         return 2;
+     }
+     const std::string mode = argv[1];
+@@ -170,6 +259,7 @@ int main(int argc, char** argv) {
+     else if (mode == "absent") Absent();
+     else if (mode == "damaged") Damaged(root);
+     else if (mode == "invalid") Invalid(root);
++    else if (mode == "wrapped") Wrapped(root);
+     else return 2;
+     std::error_code error;
+     std::filesystem::current_path(std::filesystem::temp_directory_path(), error);
+--
+2.43.0

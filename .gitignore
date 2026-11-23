@@ -1,3 +1,6 @@
+# macOS metadata
+.DS_Store
+
 # Game files are copyrighted and huge: never commit
 /Game/
 /Analysis/elf/

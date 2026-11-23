@@ -1,0 +1,1501 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude Code <noreply@anthropic.com>
+Date: Sun, 22 Nov 2026 00:00:00 +0000
+Subject: [PATCH 29/29] feat(libc): stream read-only app0 archive stdio
+
+Preserve the guest FILE prefix and loose-file behavior while routing archive
+streams through the existing shared archive descriptor cursor. Use native
+FILE objects only for descriptor lifetime and locking, never archive bytes.
+
+Implement archive opening, reads, character and status operations, positions,
+pushback, flushing, descriptor sharing and reopening. Stream narrow scanf
+fields incrementally and reject unsupported operations explicitly. Synchronize
+backend transitions after descriptor replacement and preserve reopening kinds.
+
+Exercise root param.sfx, binary odx fallback, compressed-block reads, damaged
+input, partial elements, guest layout, scanning, shared kernel positions,
+read-only refusals, descriptor cleanup and concurrent backend transitions.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+diff --git a/core/libs/prx/libc/CMakeLists.txt b/core/libs/prx/libc/CMakeLists.txt
+index b20cc24b4d..79a84ff8ea 100644
+--- a/core/libs/prx/libc/CMakeLists.txt
++++ b/core/libs/prx/libc/CMakeLists.txt
+@@ -49,6 +49,8 @@ target_sources(libc PRIVATE
+         ${CMAKE_CURRENT_SOURCE_DIR}/Export.cpp
+         ${CMAKE_CURRENT_SOURCE_DIR}/src/General.cpp
+         ${CMAKE_CURRENT_SOURCE_DIR}/src/AppArchive.cpp
++        ${CMAKE_CURRENT_SOURCE_DIR}/src/ArchiveStdio.cpp
++        ${CMAKE_CURRENT_SOURCE_DIR}/src/ArchiveScanning.cpp
+         ${CMAKE_CURRENT_SOURCE_DIR}/src/CreationMask.cpp
+         ${CMAKE_CURRENT_SOURCE_DIR}/src/FailureReport.cpp
+         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/gcc/StackGuard.cpp
+@@ -245,7 +247,7 @@ if(BUILD_TESTING)
+     target_include_directories(guest_app_archive_tests PRIVATE ${LIBS_INCLUDE_DIR})
+     target_link_libraries(guest_app_archive_tests PRIVATE libc zarchive)
+     configure_windows_unwind(guest_app_archive_tests)
+-    foreach(mode present absent damaged invalid)
++    foreach(mode present absent damaged invalid wrapped)
+         add_test(NAME guest_app_archive_${mode} COMMAND guest_app_archive_tests ${mode})
+         set_tests_properties(guest_app_archive_${mode} PROPERTIES TIMEOUT 20)
+         if(WIN32)
+@@ -254,6 +256,19 @@ if(BUILD_TESTING)
+         endif()
+     endforeach()
+
++    add_test_executable(guest_archive_stdio_tests ${LIBS_INCLUDE_DIR}/tests/GuestArchiveStdio.cpp)
++    target_include_directories(guest_archive_stdio_tests PRIVATE ${LIBS_INCLUDE_DIR})
++    target_link_libraries(guest_archive_stdio_tests PRIVATE libc libkernel zarchive)
++    configure_windows_unwind(guest_archive_stdio_tests)
++    foreach(mode archive plain damaged)
++        add_test(NAME guest_archive_stdio_${mode} COMMAND guest_archive_stdio_tests ${mode})
++        set_tests_properties(guest_archive_stdio_${mode} PROPERTIES TIMEOUT 20)
++        if(WIN32)
++            set_tests_properties(guest_archive_stdio_${mode} PROPERTIES ENVIRONMENT_MODIFICATION
++                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
++        endif()
++    endforeach()
++
+     add_test_executable(guest_array_callbacks_tests ${LIBS_INCLUDE_DIR}/tests/GuestArrayCallbacks.cpp)
+     target_include_directories(guest_array_callbacks_tests PRIVATE ${LIBS_INCLUDE_DIR})
+     target_link_libraries(guest_array_callbacks_tests PRIVATE libc)
+diff --git a/core/libs/prx/libc/include/FileStream.hpp b/core/libs/prx/libc/include/FileStream.hpp
+index 7d37193c26..0108640afb 100644
+--- a/core/libs/prx/libc/include/FileStream.hpp
++++ b/core/libs/prx/libc/include/FileStream.hpp
+@@ -70,8 +70,23 @@ class FileStream {
+     bool guestError = false;
+     bool randomDevice = false;
+     bool directory = false;
++    int archiveDescriptor = -1;
++    int archivePushback = EOF;
++    bool archiveEnd = false;
+
+ public:
++    bool IsArchive();
++    void MarkArchive();
++    void DetachArchive();
++    std::size_t ReadArchive(void* buffer, std::size_t bytes);
++    int PeekArchive();
++    int UngetArchive(int value);
++    int SeekArchive(std::int64_t offset, int origin);
++    std::int64_t TellArchive();
++    int FlushArchive();
++    void PurgeArchive() { archivePushback = EOF; }
++    bool RejectArchiveWrite();
++
+     explicit FileStream(std::FILE* handle, bool dynamic = false) : _handle(handle), _dynamic(dynamic) {
+         if (!_handle) throw std::runtime_error("FileStream: null handle");
+ #ifdef _WIN32
+@@ -108,11 +123,23 @@ public:
+     }
+
+     void Detach() {
++        DetachArchive();
+         _handle = nullptr;
+         _guest.flags = 0;
+         _guest.descriptor = -1;
+     }
+
++    std::FILE* Release() {
++        auto* handle = GetHandle();
++        archiveDescriptor = -1;
++        archivePushback = EOF;
++        archiveEnd = false;
++        _handle = nullptr;
++        _guest.flags = 0;
++        _guest.descriptor = -1;
++        return handle;
++    }
++
+     void RestoreHostStandard(std::FILE* stream, int kept) {
+         const int error = errno;
+ #ifdef _WIN32
+@@ -150,6 +177,10 @@ public:
+         _guest = {};
+         guestError = false;
+         randomDevice = false;
++        directory = false;
++        archiveDescriptor = -1;
++        archivePushback = EOF;
++        archiveEnd = false;
+         if (!_handle) return false;
+         _guest.flags = 0x10;
+ #ifdef _WIN32
+@@ -241,11 +272,13 @@ public:
+     }
+     void SyncStatus() {
+         if (!_handle) return;
++        if (IsArchive()) { PublishStatus(archiveEnd, guestError); return; }
+         PublishStatus(std::feof(GetHandle()) != 0, std::ferror(GetHandle()) != 0 || guestError);
+     }
+
+     void SyncUnlockedStatus() {
+         if (!_handle) return;
++        if (IsArchive()) { PublishStatus(archiveEnd, guestError); return; }
+ #ifdef _WIN32
+         const bool endOfFile = std::feof(GetHandle()) != 0;
+         const bool error = std::ferror(GetHandle()) != 0;
+@@ -344,6 +377,7 @@ public:
+
+     void ClearError() {
+         if (!_handle) return;
++        archiveEnd = false;
+         std::clearerr(GetHandle());
+         guestError = false;
+         SyncStatus();
+@@ -351,6 +385,7 @@ public:
+
+     int Close() {
+         GetHandle();
++        DetachArchive();
+ #ifdef _WIN32
+         GuestFileLockForget_nid_no_patch(::_fileno(_handle));
+         if (std::exchange(directory, false)) ForgetDirectoryStream_nid_no_patch(::_fileno(_handle));
+@@ -371,9 +406,32 @@ inline std::FILE* GetStreamHandle(FileStream* stream) {
+ inline std::FILE* GetNativeStream(FileStream* stream) {
+     auto* handle = GetStreamHandle(stream);
+     if (stream->IsRandomDevice()) throw std::runtime_error("FileStream: this function is not implemented on a /dev/random or /dev/urandom stream");
++    if (stream->IsArchive()) throw std::runtime_error("FileStream: this function is not implemented on an app0.zar stream");
+     return handle;
+ }
+
++class FileStreamLock {
++    std::FILE* handle;
++
++public:
++    explicit FileStreamLock(FileStream* stream) : handle(GetStreamHandle(stream)) {
++#ifdef _WIN32
++        ::_lock_file(handle);
++#else
++        ::flockfile(handle);
++#endif
++    }
++    ~FileStreamLock() {
++#ifdef _WIN32
++        ::_unlock_file(handle);
++#else
++        ::funlockfile(handle);
++#endif
++    }
++    FileStreamLock(const FileStreamLock&) = delete;
++    FileStreamLock& operator=(const FileStreamLock&) = delete;
++};
++
+ extern "C" {
+ extern FileStream _Stdout_nid_postfix;
+ extern FileStream _Stderr_nid_postfix;
+diff --git a/core/libs/prx/libc/src/FileAndHeap.cpp b/core/libs/prx/libc/src/FileAndHeap.cpp
+index 9078a5fe41..2e8da369f0 100644
+--- a/core/libs/prx/libc/src/FileAndHeap.cpp
++++ b/core/libs/prx/libc/src/FileAndHeap.cpp
+@@ -305,8 +305,9 @@ FileStream* APS5_VABI fdopen_nid_postfix(int descriptor, const char* mode) {
+     if (!mode) { errno = 22; return nullptr; }
+     const auto parsed = ParseFileMode(mode);
+     if (!parsed) { errno = 22; return nullptr; }
+-    if (descriptor < 0) return nullptr;
+-    AppArchiveRefuseDescriptor_nid_no_patch(descriptor, "fdopen");
++    if (descriptor < 0) { errno = 9; return nullptr; }
++    const bool archived = AppArchiveDescriptor_nid_no_patch(descriptor, nullptr, nullptr);
++    if (archived && parsed->writes) { errno = 9; return nullptr; }
+     try {
+         auto nativeMode = parsed->native;
+         std::erase(nativeMode, 'x');
+@@ -322,6 +323,7 @@ FileStream* APS5_VABI fdopen_nid_postfix(int descriptor, const char* mode) {
+ #endif
+         if (!native) return nullptr;
+         auto* stream = new (storage.get()) FileStream(native, true);
++        if (archived) stream->MarkArchive();
+         storage.release();
+         return stream;
+     } catch (const std::bad_alloc&) { errno = 12; return nullptr; }
+@@ -374,6 +376,28 @@ static FileStream* OpenDirectoryStream(const std::filesystem::path& path) {
+ }
+ #endif
+
++static FileStream* OpenArchiveStream(const AppArchiveNode& node, const GuestFileMode& mode) {
++    if (mode.exclusive) { errno = 17; return nullptr; }
++    if (mode.writes) { errno = 30; return nullptr; }
++    if (node.Directory) { errno = 21; return nullptr; }
++#ifdef _WIN32
++    std::unique_ptr<std::FILE, int (*)(std::FILE*)> handle(std::fopen("NUL", "rb"), std::fclose);
++#else
++    std::unique_ptr<std::FILE, int (*)(std::FILE*)> handle(std::fopen("/dev/null", "rb"), std::fclose);
++#endif
++    if (!handle) { errno = GuestErrnoFromHost_nid_no_patch(errno); return nullptr; }
++    auto stream = std::make_unique<FileStream>(handle.get(), true);
++#ifdef _WIN32
++    const int descriptor = ::_fileno(handle.get());
++#else
++    const int descriptor = ::fileno(handle.get());
++#endif
++    AppArchiveAttach_nid_no_patch(descriptor, node);
++    stream->MarkArchive();
++    handle.release();
++    return stream.release();
++}
++
+ FileStream* APS5_VABI freopen_nid_postfix(const char* filename, const char* mode, FileStream* stream) {
+     if (!stream || !mode) { errno = 22; return nullptr; }
+     if (!filename && !stream->IsOpen()) { errno = 9; return nullptr; }
+@@ -382,13 +406,32 @@ FileStream* APS5_VABI freopen_nid_postfix(const char* filename, const char* mode
+     if (!parsed) { errno = 22; return nullptr; }
+     try {
+         std::filesystem::path path;
+-        if (const int error = *filename ? ResolvePathError_nid_no_patch(filename, path) : 2) {
++        if (const int error = *filename ? ResolvePathError_nid_no_patch(filename, path, false, true) : 2) {
+             if (stream->IsHostStandard()) stream->Detach();
+             else if (stream->IsOpen()) stream->Close();
+             if (stream->IsDynamic()) delete stream;
+             errno = error;
+             return nullptr;
+         }
++        if (stream->IsArchive() || AppArchiveOnly_nid_no_patch(path)) {
++            std::unique_ptr<FileStream> replacement(fopen_nid_postfix(filename, mode));
++            const int error = errno;
++            if (stream->IsHostStandard()) stream->Detach();
++            else if (stream->IsOpen()) stream->Close();
++            if (!replacement) {
++                if (stream->IsDynamic()) delete stream;
++                errno = error;
++                return nullptr;
++            }
++            const bool archived = replacement->IsArchive();
++            const bool random = replacement->IsRandomDevice();
++            const bool directory = replacement->IsDirectory();
++            stream->Adopt(replacement->Release());
++            if (archived) stream->MarkArchive();
++            if (random) stream->MarkRandomDevice();
++            if (directory) stream->MarkDirectory();
++            return stream;
++        }
+         if (stream->Reopen(path, parsed->native.c_str(), OpenNative)) {
+ #ifdef _WIN32
+             if (parsed->append && !AppendOnlyDescriptor(_fileno(stream->GetHandle()))) {
+@@ -433,7 +476,11 @@ FileStream* APS5_VABI fopen_nid_postfix(const char* filename, const char* mode)
+         return stream.release();
+     }
+     std::filesystem::path fpath;
+-    if (const int error = ResolvePathError_nid_no_patch(filename, fpath)) { errno = error; return nullptr; }
++    if (const int error = ResolvePathError_nid_no_patch(filename, fpath, false, true)) { errno = error; return nullptr; }
++    if (AppArchiveOnly_nid_no_patch(fpath)) {
++        AppArchiveNode node{};
++        if (AppArchiveLookup_nid_no_patch(fpath, &node)) return OpenArchiveStream(node, *parsed);
++    }
+     std::unique_ptr<std::FILE, int (*)(std::FILE*)> handle(OpenNative(fpath, parsed->native), std::fclose);
+     if (!handle) {
+         const int hostError = errno;
+@@ -508,7 +555,14 @@ FileStream* APS5_VABI _ZSt7_FiopenPKcNSt5_IosbIiE9_OpenmodeEi_nid_postfix(const
+ }
+
+ size_t APS5_VABI fread_nid_postfix(void* buffer, size_t size, size_t count, FileStream* stream) {
+-    if (size != 0 && count > std::numeric_limits<std::size_t>::max() / size) { errno = EINVAL; return 0; }
++    if (size != 0 && count > std::numeric_limits<std::size_t>::max() / size) {
++        if (stream && stream->IsArchive() && stream->IsOpen()) {
++            const FileStreamLock lock(stream);
++            stream->SetError();
++        }
++        errno = 22;
++        return 0;
++    }
+     if (stream && !stream->IsOpen()) { errno = 9; return 0; }
+     auto* handle = GetStreamHandle(stream);
+     if (size == 0 || count == 0) return 0;
+@@ -522,6 +576,10 @@ size_t APS5_VABI fread_nid_postfix(void* buffer, size_t size, size_t count, File
+         stream->SyncStatus();
+         return count;
+     }
++    if (stream->IsArchive()) {
++        const FileStreamLock lock(stream);
++        return stream->ReadArchive(buffer, bytes) / size;
++    }
+     if (!stream->SwitchToReading()) return 0;
+     const auto result = std::fread(buffer, size, count, handle);
+     stream->SyncStatus();
+@@ -531,8 +589,10 @@ size_t APS5_VABI fread_nid_postfix(void* buffer, size_t size, size_t count, File
+
+ size_t APS5_VABI fwrite_nid_postfix(const void* buffer, size_t size, size_t count, FileStream* stream) {
+     if (stream && !stream->IsOpen()) { errno = 9; return 0; }
+-    auto* handle = GetNativeStream(stream);
++    GetStreamHandle(stream);
+     if (size == 0 || count == 0) return 0;
++    if (stream->RejectArchiveWrite()) return 0;
++    auto* handle = GetNativeStream(stream);
+     if (!buffer) throw std::runtime_error("fwrite: null buffer");
+     if (count > std::numeric_limits<std::size_t>::max() / size) throw std::overflow_error("fwrite: buffer size overflow");
+     const auto bytes = size * count;
+@@ -547,6 +607,10 @@ size_t APS5_VABI fwrite_nid_postfix(const void* buffer, size_t size, size_t coun
+ int APS5_VABI fseeko_nid_postfix(FileStream* stream, std::int64_t offset, int origin) {
+     if (stream && !stream->IsOpen()) { errno = 9; return -1; }
+     if (origin != SEEK_SET && origin != SEEK_CUR && origin != SEEK_END) { errno = 22; return -1; }
++    if (stream && stream->IsArchive()) {
++        const FileStreamLock lock(stream);
++        return stream->SeekArchive(offset, origin);
++    }
+ #ifdef _WIN32
+     auto* native = GetNativeStream(stream);
+     if (IsPipeStream(native)) { errno = 29; return -1; }
+@@ -563,6 +627,10 @@ int APS5_VABI fseeko_nid_postfix(FileStream* stream, std::int64_t offset, int or
+
+ std::int64_t APS5_VABI ftello_nid_postfix(FileStream* stream) {
+     if (stream && !stream->IsOpen()) { errno = 9; return -1; }
++    if (stream && stream->IsArchive()) {
++        const FileStreamLock lock(stream);
++        return stream->TellArchive();
++    }
+ #ifdef _WIN32
+     auto* native = GetNativeStream(stream);
+     if (IsPipeStream(native)) { errno = 29; return -1; }
+@@ -603,6 +671,7 @@ void APS5_VABI rewind_nid_postfix(FileStream* stream) {
+ int APS5_VABI fputs_nid_postfix(const char* str, FileStream* stream) {
+     if (!str) throw std::runtime_error("fputs: null string");
+     if (stream && !stream->IsOpen()) { errno = 9; return -1; }
++    if (stream && stream->RejectArchiveWrite()) return -1;
+     auto* native = GetNativeStream(stream);
+     if (*str != '\0' && !stream->SwitchToWriting()) return -1;
+     const int result = std::fputs(str, native);
+@@ -613,6 +682,10 @@ int APS5_VABI fputs_nid_postfix(const char* str, FileStream* stream) {
+ int APS5_VABI fflush_nid_postfix(FileStream* stream) {
+     if (stream && !stream->IsOpen()) { errno = 9; return -1; }
+     std::FILE* native = stream ? GetStreamHandle(stream) : nullptr;
++    if (stream && stream->IsArchive()) {
++        const FileStreamLock lock(stream);
++        return stream->FlushArchive();
++    }
+     if (stream && (stream->IsRandomDevice() || stream->IsDirectory())) return 0;
+ #ifdef __linux__
+     if (native && !__fwriting(native)) return 0;
+diff --git a/core/libs/prx/libc/src/Formatting.cpp b/core/libs/prx/libc/src/Formatting.cpp
+index ac280da5ab..738bc4ae48 100644
+--- a/core/libs/prx/libc/src/Formatting.cpp
++++ b/core/libs/prx/libc/src/Formatting.cpp
+@@ -20,6 +20,8 @@
+
+ #include "prx/libc/include/WindowsFormatting.hpp"
+ #include "prx/libc/include/ScanWideField.hpp"
++#include "prx/libc/include/ArchiveStdio.hpp"
++#include "prx/libc/include/GuestArena.hpp"
+
+ #ifdef _WIN32
+ #include "prx/libc/include/WindowsScanning.hpp"
+@@ -185,6 +187,25 @@ public:
+     }
+ };
+
++class ArchiveSource {
++    FileStream* file;
++    std::ptrdiff_t consumed = 0;
++
++public:
++    static constexpr bool Contiguous = false;
++    explicit ArchiveSource(FileStream* stream) : file(stream) {}
++    int Peek() const { return file->PeekArchive(); }
++    void Skip() {
++        unsigned char value = 0;
++        if (file->ReadArchive(&value, 1) == 1) ++consumed;
++    }
++    void Advance(std::ptrdiff_t count) { consumed += count; }
++    std::ptrdiff_t Consumed() const { return consumed; }
++    int Scan(const char* directive, bool suppress, void* target, int* count) const {
++        return ScanArchiveField_nid_no_patch(file, directive, suppress, target, count);
++    }
++};
++
+ template <typename TSource, typename NextPointer, typename NextCapacity>
+ int ScanSource(TSource source, const char* format, bool secure, NextPointer nextPointer, NextCapacity nextCapacity) {
+     if (format == nullptr) return EOF;
+@@ -231,6 +252,9 @@ int ScanSource(TSource source, const char* format, bool secure, NextPointer next
+                 void* target = nextPointer();
+                 if (target == nullptr) return EOF;
+                 const auto count = source.Consumed();
++                const std::size_t bytes = length == "hh" ? 1 : length == "h" ? sizeof(short) : length.empty() ? sizeof(int) : sizeof(std::int64_t);
++                const GuestArena::HostWrite destination(target, bytes);
++                if (!destination.Open()) throw std::runtime_error("scanf: count is not writable");
+                 if (length == "hh") *static_cast<signed char*>(target) = static_cast<signed char>(count);
+                 else if (length == "h") *static_cast<short*>(target) = static_cast<short>(count);
+                 else if (length.empty()) *static_cast<int*>(target) = static_cast<int>(count);
+@@ -312,7 +336,11 @@ int ScanSource(TSource source, const char* format, bool secure, NextPointer next
+             const unsigned long limit = conversion == 'c' ? capacity : (capacity == 0 ? 0 : capacity - 1);
+             const unsigned long wanted = conversion == 'c' ? (width == 0 ? 1 : width) : width;
+             if (limit == 0 || (conversion == 'c' && wanted > limit)) {
+-                if (capacity != 0) static_cast<char*>(target)[0] = '\0';
++                if (capacity != 0) {
++                    const GuestArena::HostWrite destination(target, 1);
++                    if (!destination.Open()) throw std::runtime_error("scanf: buffer is not writable");
++                    static_cast<char*>(target)[0] = '\0';
++                }
+                 return finish(assigned);
+             }
+             capped = wanted == 0 || wanted > limit;
+@@ -324,7 +352,7 @@ int ScanSource(TSource source, const char* format, bool secure, NextPointer next
+         directive += "%n";
+         int consumed = -1;
+         const int matched = source.Scan(directive.c_str(), suppress, target, &consumed);
+-        if (consumed < 0 || (!suppress && matched != 1)) return finish(!converted && source.Peek() == EOF ? EOF : assigned);
++        if (consumed < 0 || (!suppress && matched != 1)) return finish(!converted && matched == EOF ? EOF : assigned);
+         source.Advance(consumed);
+         if (capped && conversion != 'c') {
+             const int next = source.Peek();
+@@ -337,6 +365,8 @@ int ScanSource(TSource source, const char* format, bool secure, NextPointer next
+                 overflow = std::sscanf(text, test.c_str(), probe) == 1;
+             }
+             if (overflow) {
++                const GuestArena::HostWrite destination(target, 1);
++                if (!destination.Open()) throw std::runtime_error("scanf: buffer is not writable");
+                 static_cast<char*>(target)[0] = '\0';
+                 return finish(assigned);
+             }
+@@ -357,6 +387,11 @@ template <typename NextPointer, typename NextCapacity>
+ int ScanGuestStream(FileStream* stream, const char* format, NextPointer nextPointer, NextCapacity nextCapacity) {
+     if (stream == nullptr || format == nullptr) return EOF;
+     if (!stream->IsOpen()) { errno = 9; return EOF; }
++    if (stream->IsArchive()) {
++        RequireArchiveScan_nid_no_patch(format);
++        const FileStreamLock lock(stream);
++        return ScanSource(ArchiveSource(stream), format, true, nextPointer, nextCapacity);
++    }
+     auto* native = GetNativeStream(stream);
+     if (!stream->SwitchToReading()) return EOF;
+ #ifndef _WIN32
+@@ -408,6 +443,7 @@ int APS5_VABI vasprintf_nid_postfix(char** destination, const char* format, VaLi
+
+ int APS5_VABI vfprintf_nid_postfix(FileStream* stream, const char* format, VaList* args) {
+     if (stream && !stream->IsOpen()) { errno = 9; return -1; }
++    if (stream && stream->RejectArchiveWrite()) return -1;
+     auto* native = GetNativeStream(stream);
+     if (!stream->SwitchToWriting()) return -1;
+ #ifdef _WIN32
+@@ -450,23 +486,19 @@ int APS5_VABI fprintf_nid_postfix(FileStream* stream, const char* format, ...) {
+ }
+
+ int APS5_VABI fscanf_nid_postfix(FileStream* stream, const char* format, ...) {
+-    if (stream && !stream->IsOpen()) { errno = 9; return -1; }
+-    auto* native = GetNativeStream(stream);
+-    if (!stream->SwitchToReading()) return EOF;
+ #ifdef _WIN32
+     __builtin_sysv_va_list args;
+     __builtin_sysv_va_start(args, format);
+-    const int result = LibcDetail::ScanFileWindows_nid_no_patch(native, format, args);
+-    __builtin_sysv_va_end(args);
+ #else
+-    RejectGuestWideScan(format);
+     std::va_list args;
+     va_start(args, format);
+-    const int result = HostVfscanf(native, format, args);
++#endif
++    const int result = vfscanf_nid_postfix(stream, format, reinterpret_cast<VaList*>(args));
++#ifdef _WIN32
++    __builtin_sysv_va_end(args);
++#else
+     va_end(args);
+ #endif
+-    stream->SyncStatus();
+-    stream->KeepDirectoryReadError(result == -1);
+     return result;
+ }
+
+@@ -661,6 +693,7 @@ int APS5_VABI vsnprintf_s_nid_postfix(char* buffer, size_t size, const char* for
+ static int WriteSecure(FileStream* stream, const char* format, const void* args) {
+     if (stream == nullptr || format == nullptr || args == nullptr) return -1;
+     if (!stream->IsOpen()) { errno = 9; return -1; }
++    if (stream->RejectArchiveWrite()) return -1;
+     auto* native = GetNativeStream(stream);
+     if (!stream->SwitchToWriting()) return -1;
+     std::string text;
+@@ -779,6 +812,13 @@ extern FileStream* __stdinp_nid_postfix;
+
+ int APS5_VABI vfscanf_nid_postfix(FileStream* stream, const char* format, VaList* args) {
+     if (stream && !stream->IsOpen()) { errno = 9; return -1; }
++    if (stream && stream->IsArchive()) {
++        if (!format || !args) { errno = 22; return EOF; }
++        RequireArchiveScan_nid_no_patch(format);
++        const FileStreamLock lock(stream);
++        LibcDetail::FormatArguments arguments(args);
++        return ScanSource(ArchiveSource(stream), format, false, [&] { return arguments.Next<void*>(); }, [] { return 0u; });
++    }
+     auto* native = GetNativeStream(stream);
+     if (!stream->SwitchToReading()) return EOF;
+ #ifdef _WIN32
+diff --git a/core/libs/prx/libc/src/ScanningWide.cpp b/core/libs/prx/libc/src/ScanningWide.cpp
+index cccfa535b1..a3500a60d6 100644
+--- a/core/libs/prx/libc/src/ScanningWide.cpp
++++ b/core/libs/prx/libc/src/ScanningWide.cpp
+@@ -520,12 +520,14 @@ extern FileStream* __stdinp_nid_postfix;
+
+ int APS5_VABI vfwscanf_nid_postfix(FileStream* stream, const char16_t* format, VaList* args) {
+     if (stream == nullptr || format == nullptr) return EOF;
++    if (stream->IsArchive()) NotImplemented_nid_no_patch("wide scanf app0.zar stream");
+     const LockedStream lock(stream);
+     return WideScanner("vfwscanf", false, WideInput(stream), format, args).Run();
+ }
+
+ int APS5_VABI vfwscanf_s_nid_postfix(FileStream* stream, const char16_t* format, VaList* args) {
+     if (stream == nullptr || format == nullptr) return EOF;
++    if (stream->IsArchive()) NotImplemented_nid_no_patch("wide scanf app0.zar stream");
+     const LockedStream lock(stream);
+     return WideScanner("vfwscanf_s", true, WideInput(stream), format, args).Run();
+ }
+diff --git a/core/libs/prx/libc/src/StandardStreams.cpp b/core/libs/prx/libc/src/StandardStreams.cpp
+index de2549b946..5e20f774f5 100644
+--- a/core/libs/prx/libc/src/StandardStreams.cpp
++++ b/core/libs/prx/libc/src/StandardStreams.cpp
+@@ -1,6 +1,7 @@
+ #include "prx/libc/include/Api.hpp"
+ #include "prx/libc/include/FileStream.hpp"
+ #include "prx/libc/include/General.hpp"
++#include "prx/libc/include/GuestArena.hpp"
+ #include "prx/libc/include/general/VabiMacros.hpp"
+ #include <cerrno>
+ #include <cstddef>
+@@ -89,6 +90,11 @@ int __isthreaded_nid_postfix = 1;
+
+ int APS5_VABI fgetc_nid_postfix(FileStream* stream) {
+     if (stream && !stream->IsOpen()) { errno = 9; return -1; }
++    if (stream && stream->IsArchive()) {
++        const FileStreamLock lock(stream);
++        unsigned char value = 0;
++        return stream->ReadArchive(&value, 1) == 1 ? value : EOF;
++    }
+     auto* native = GetNativeStream(stream);
+     if (!stream->SwitchToReading()) return -1;
+     const int result = std::fgetc(native);
+@@ -132,6 +138,7 @@ std::int32_t APS5_VABI ungetwc_nid_postfix(std::int32_t value, FileStream* strea
+         stream->SetError();
+         return -1;
+     }
++    if (stream && stream->IsArchive()) return ungetc_nid_postfix(value, stream);
+     auto* native = GetNativeStream(stream);
+     if (!stream->SwitchToReading()) return -1;
+     const int result = std::ungetc(value, native);
+@@ -141,6 +148,10 @@ std::int32_t APS5_VABI ungetwc_nid_postfix(std::int32_t value, FileStream* strea
+ int APS5_VABI getc_nid_postfix(FileStream* stream) { return fgetc_nid_postfix(stream); }
+ int APS5_VABI getc_unlocked_nid_postfix(FileStream* stream) {
+     if (stream && !stream->IsOpen()) { errno = 9; return -1; }
++    if (stream && stream->IsArchive()) {
++        unsigned char value = 0;
++        return stream->ReadArchive(&value, 1) == 1 ? value : EOF;
++    }
+     auto* native = GetNativeStream(stream);
+     if (!stream->SwitchToReadingUnlocked()) return -1;
+ #ifdef _WIN32
+@@ -184,6 +195,7 @@ std::int32_t APS5_VABI getwchar_nid_postfix() { return fgetwc_nid_postfix(__stdi
+ int APS5_VABI getchar_unlocked_nid_postfix() { return getc_unlocked_nid_postfix(__stdinp_nid_postfix); }
+ int APS5_VABI fputc_nid_postfix(int value, FileStream* stream) {
+     if (stream && !stream->IsOpen()) { errno = 9; return -1; }
++    if (stream && stream->RejectArchiveWrite()) return -1;
+     auto* native = GetNativeStream(stream);
+     if (!stream->SwitchToWriting()) return -1;
+     const int result = std::fputc(value, native);
+@@ -193,6 +205,7 @@ int APS5_VABI fputc_nid_postfix(int value, FileStream* stream) {
+ int APS5_VABI putc_nid_postfix(int value, FileStream* stream) { return fputc_nid_postfix(value, stream); }
+ int APS5_VABI putc_unlocked_nid_postfix(int value, FileStream* stream) {
+     if (stream && !stream->IsOpen()) { errno = 9; return -1; }
++    if (stream && stream->RejectArchiveWrite()) return -1;
+     auto* native = GetNativeStream(stream);
+     if (!stream->SwitchToWritingUnlocked()) return -1;
+ #ifdef _WIN32
+@@ -208,6 +221,10 @@ int APS5_VABI putchar_nid_postfix(int value) { return fputc_nid_postfix(value, _
+ int APS5_VABI putchar_unlocked_nid_postfix(int value) { return putc_unlocked_nid_postfix(value, __stdoutp_nid_postfix); }
+ int APS5_VABI ungetc_nid_postfix(int value, FileStream* stream) {
+     if (stream && !stream->IsOpen()) { errno = 9; return -1; }
++    if (stream && stream->IsArchive()) {
++        const FileStreamLock lock(stream);
++        return stream->UngetArchive(value);
++    }
+     auto* native = GetNativeStream(stream);
+     if (value != EOF && !stream->SwitchToReading()) return -1;
+     const int result = std::ungetc(value, native);
+@@ -221,6 +238,24 @@ char* APS5_VABI fgets_nid_postfix(char* buffer, int size, FileStream* stream) {
+         errno = 22;
+         return nullptr;
+     }
++    if (stream && stream->IsArchive()) {
++        if (!buffer) throw std::invalid_argument("fgets: null buffer");
++        const GuestArena::HostWrite destination(buffer, static_cast<std::size_t>(size));
++        if (!destination.Open()) throw std::runtime_error("fgets: buffer is not writable");
++        const FileStreamLock lock(stream);
++        int count = 0;
++        while (count < size - 1) {
++            unsigned char value = 0;
++            if (stream->ReadArchive(&value, 1) != 1) {
++                if (count == 0 || (stream->GuestState().flags & 0x40) != 0) return nullptr;
++                break;
++            }
++            buffer[count++] = static_cast<char>(value);
++            if (value == '\n') break;
++        }
++        buffer[count] = '\0';
++        return buffer;
++    }
+     auto* native = GetNativeStream(stream);
+     if (!stream->SwitchToReading()) return nullptr;
+     auto* result = std::fgets(buffer, size, native);
+@@ -229,10 +264,20 @@ char* APS5_VABI fgets_nid_postfix(char* buffer, int size, FileStream* stream) {
+     return result;
+ }
+ int APS5_VABI feof_nid_postfix(FileStream* stream) {
++    if (stream && stream->IsArchive()) {
++        const FileStreamLock lock(stream);
++        stream->SyncUnlockedStatus();
++        return (stream->GuestState().flags & 0x20) != 0;
++    }
+     stream->SyncStatus();
+     return (stream->GuestState().flags & 0x20) != 0;
+ }
+ int APS5_VABI ferror_nid_postfix(FileStream* stream) {
++    if (stream && stream->IsArchive()) {
++        const FileStreamLock lock(stream);
++        stream->SyncUnlockedStatus();
++        return (stream->GuestState().flags & 0x40) != 0;
++    }
+     stream->SyncStatus();
+     return (stream->GuestState().flags & 0x40) != 0;
+ }
+@@ -247,14 +292,19 @@ int APS5_VABI ferror_unlocked_nid_postfix(FileStream* stream) {
+     return (stream->GuestState().flags & 0x40) != 0;
+ }
+ void APS5_VABI clearerr_nid_postfix(FileStream* stream) {
++    if (stream && stream->IsArchive()) {
++        const FileStreamLock lock(stream);
++        stream->ClearError();
++        return;
++    }
+     stream->ClearError();
+ }
+ int APS5_VABI fileno_nid_postfix(FileStream* stream) {
+     if (stream && !stream->IsOpen()) { errno = 9; return -1; }
+ #ifdef _WIN32
+-    const int descriptor = _fileno(GetNativeStream(stream));
++    const int descriptor = _fileno(stream && stream->IsArchive() ? GetStreamHandle(stream) : GetNativeStream(stream));
+ #else
+-    const int descriptor = ::fileno(GetNativeStream(stream));
++    const int descriptor = ::fileno(stream && stream->IsArchive() ? GetStreamHandle(stream) : GetNativeStream(stream));
+ #endif
+     stream->GuestState().descriptor = static_cast<std::int16_t>(descriptor);
+     return descriptor;
+@@ -271,7 +321,12 @@ int APS5_VABI fileno_unlocked_nid_postfix(FileStream* stream) {
+ }
+ int APS5_VABI setvbuf_nid_postfix(FileStream* stream, char* buffer, int mode, std::size_t size) {
+     if (stream && !stream->IsOpen()) { errno = 9; return -1; }
+-    if (mode < 0 || mode > 2) return -1;
++    if (mode < 0 || mode > 2) { errno = 22; return -1; }
++    if (stream && stream->IsArchive()) {
++        const FileStreamLock lock(stream);
++        if (mode == 2) return 0;
++        NotImplemented_nid_no_patch("setvbuf buffered app0.zar streams");
++    }
+     const int native = mode == 0 ? _IOFBF : mode == 1 ? _IOLBF : _IONBF;
+     if (native != _IONBF && size == 0) {
+         buffer = nullptr;
+diff --git a/core/libs/prx/libc/src/StreamPurge.cpp b/core/libs/prx/libc/src/StreamPurge.cpp
+index eff04b3442..bdbab3f064 100644
+--- a/core/libs/prx/libc/src/StreamPurge.cpp
++++ b/core/libs/prx/libc/src/StreamPurge.cpp
+@@ -23,6 +23,11 @@ extern "C" int APS5_VABI fpurge_nid_postfix(FileStream* stream) {
+     if (stream && !stream->IsOpen()) { errno = 9; return -1; }
+     auto* native = GetStreamHandle(stream);
+     const LockedStream lock(stream);
++    if (stream->IsArchive()) {
++        stream->PurgeArchive();
++        stream->SyncUnlockedStatus();
++        return 0;
++    }
+ #ifdef _WIN32
+     auto* state = reinterpret_cast<UcrtStreamState*>(native);
+     state->pointer = state->base;
+diff --git a/core/libs/tests/GuestKernelAppArchive.cpp b/core/libs/tests/GuestKernelAppArchive.cpp
+index d3922949f5..26380d5b0a 100644
+--- a/core/libs/tests/GuestKernelAppArchive.cpp
++++ b/core/libs/tests/GuestKernelAppArchive.cpp
+@@ -409,7 +409,11 @@ void Refusals() {
+     Directories();
+     const int fd = sceKernelOpen("/app0/Data/Small.txt", SCE_KERNEL_O_RDONLY, 0);
+     Check(fd >= 0);
+-    Check(NotImplemented([fd] { (void)fdopen_nid_postfix(fd, "r"); }));
++    Check(fdopen_nid_postfix(fd, "r+") == nullptr && *__error_nid_postfix() == 9);
++    char stdioBytes[4]{};
++    auto* stdio = fdopen_nid_postfix(fd, "r");
++    Check(stdio != nullptr && fread_nid_postfix(stdioBytes, 1, 1, stdio) == 1 && stdioBytes[0] == 'z');
++    Check(sceKernelLseek(fd, 0, 1) == 1);
+     Check(NotImplemented([fd] { (void)flock_nid_postfix(fd, 1); }));
+     Check(NotImplemented([fd] { alignas(8) char statfs[512]; (void)_fstatfs_nid_postfix(fd, reinterpret_cast<KernelStatfs*>(statfs)); }));
+     Check(NotImplemented([fd] { (void)ftruncate_nid_postfix(fd, 0); }));
+@@ -420,7 +424,8 @@ void Refusals() {
+     Check(NotImplemented([fd] { (void)sceKernelFutimes(fd, nullptr); }));
+     FileStat status{};
+     Check(sceKernelFstat(fd, &status) == 0 && status.st_size == 3);
+-    Check(sceKernelClose(fd) == 0);
++    Check(fread_nid_postfix(stdioBytes, 1, sizeof(stdioBytes), stdio) == 2 && std::memcmp(stdioBytes, "ar", 2) == 0);
++    Check(fclose_nid_postfix(stdio) == 0);
+ }
+
+ void WithoutArchive() {
+diff --git a/core/libs/prx/libc/include/ArchiveStdio.hpp b/core/libs/prx/libc/include/ArchiveStdio.hpp
+new file mode 100644
+index 0000000000..73ed59c671
+--- /dev/null
++++ b/core/libs/prx/libc/include/ArchiveStdio.hpp
+@@ -0,0 +1,9 @@
++#ifndef CORE_LIBS_PRX_LIBC_INCLUDE_ARCHIVESTDIO_HPP
++#define CORE_LIBS_PRX_LIBC_INCLUDE_ARCHIVESTDIO_HPP
++
++class FileStream;
++
++void RequireArchiveScan_nid_no_patch(const char* format);
++int ScanArchiveField_nid_no_patch(FileStream* stream, const char* directive, bool suppress, void* target, int* consumed);
++
++#endif
+diff --git a/core/libs/prx/libc/src/ArchiveStdio.cpp b/core/libs/prx/libc/src/ArchiveStdio.cpp
+new file mode 100644
+index 0000000000..b1670ac6d0
+--- /dev/null
++++ b/core/libs/prx/libc/src/ArchiveStdio.cpp
+@@ -0,0 +1,141 @@
++#include "prx/libc/include/FileStream.hpp"
++#include "prx/libc/include/AppArchive.hpp"
++
++#include <algorithm>
++#include <limits>
++
++bool FileStream::IsArchive() {
++    if (!_handle) return false;
++    const FileStreamLock lock(this);
++#ifdef _WIN32
++    const int descriptor = ::_fileno(_handle);
++#else
++    const int descriptor = ::fileno(_handle);
++#endif
++    const bool attached = AppArchiveDescriptor_nid_no_patch(descriptor, nullptr, nullptr);
++    if (attached && archiveDescriptor < 0) MarkArchive();
++    else if (!attached && archiveDescriptor >= 0) {
++        archiveDescriptor = -1;
++        archivePushback = EOF;
++        archiveEnd = false;
++        _guest.flags = 0x10;
++    }
++    return attached;
++}
++
++bool FileStream::RejectArchiveWrite() {
++    if (!IsArchive()) return false;
++    const FileStreamLock lock(this);
++    errno = 9;
++    SetError();
++    return true;
++}
++
++void FileStream::MarkArchive() {
++#ifdef _WIN32
++    archiveDescriptor = ::_fileno(GetHandle());
++#else
++    archiveDescriptor = ::fileno(GetHandle());
++#endif
++    _guest.flags = 4;
++    archiveEnd = false;
++    archivePushback = EOF;
++}
++
++void FileStream::DetachArchive() {
++    if (IsArchive()) AppArchiveDetach_nid_no_patch(std::exchange(archiveDescriptor, -1));
++    archivePushback = EOF;
++    archiveEnd = false;
++}
++
++std::size_t FileStream::ReadArchive(void* buffer, std::size_t bytes) {
++    if (bytes == 0 || archiveEnd) return 0;
++    std::size_t total = 0;
++    auto* output = static_cast<unsigned char*>(buffer);
++    if (archivePushback != EOF) {
++        *output++ = static_cast<unsigned char>(std::exchange(archivePushback, EOF));
++        total = 1;
++    }
++    if (total != bytes) {
++        const AppArchiveBuffer destination{output, bytes - total};
++        std::uint64_t done = 0;
++        try {
++            if (!AppArchiveDescriptorRead_nid_no_patch(archiveDescriptor, &destination, 1, nullptr, &done)) {
++                errno = 9;
++                SetError();
++                return total;
++            }
++        } catch (const std::runtime_error&) {
++            errno = 5;
++            SetError();
++            return total;
++        }
++        total += static_cast<std::size_t>(done);
++        if (total < bytes) archiveEnd = true;
++    }
++    SyncUnlockedStatus();
++    return total;
++}
++
++int FileStream::PeekArchive() {
++    if (archiveEnd) return EOF;
++    if (archivePushback != EOF) return archivePushback;
++    const auto position = TellArchive();
++    if (position < 0) return EOF;
++    unsigned char value = 0;
++    const AppArchiveBuffer destination{&value, 1};
++    std::uint64_t done = 0;
++    try {
++        if (!AppArchiveDescriptorRead_nid_no_patch(archiveDescriptor, &destination, 1, &position, &done)) {
++            errno = 9;
++            SetError();
++            return EOF;
++        }
++    } catch (const std::runtime_error&) {
++        errno = 5;
++        SetError();
++        return EOF;
++    }
++    if (done != 0) return value;
++    archiveEnd = true;
++    SyncUnlockedStatus();
++    return EOF;
++}
++
++int FileStream::UngetArchive(int value) {
++    if (value == EOF || archivePushback != EOF) return EOF;
++    archivePushback = static_cast<unsigned char>(value);
++    archiveEnd = false;
++    SyncUnlockedStatus();
++    return archivePushback;
++}
++
++std::int64_t FileStream::TellArchive() {
++    std::uint64_t position = 0;
++    if (!AppArchiveDescriptor_nid_no_patch(archiveDescriptor, nullptr, &position)) { errno = 9; return -1; }
++    if (position > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) { errno = 84; return -1; }
++    return static_cast<std::int64_t>(position) - (archivePushback == EOF ? 0 : 1);
++}
++
++int FileStream::FlushArchive() {
++    const bool end = archiveEnd;
++    const int result = SeekArchive(0, SEEK_CUR);
++    archiveEnd = end;
++    SyncUnlockedStatus();
++    return result;
++}
++
++int FileStream::SeekArchive(std::int64_t offset, int origin) {
++    if (origin != SEEK_SET && origin != SEEK_CUR && origin != SEEK_END) { errno = 22; return -1; }
++    if (origin == SEEK_CUR && archivePushback != EOF) {
++        if (offset == std::numeric_limits<std::int64_t>::min()) { errno = 22; return -1; }
++        --offset;
++    }
++    std::int64_t position = -1;
++    if (!AppArchiveDescriptorSeek_nid_no_patch(archiveDescriptor, offset, origin, &position)) { errno = 9; return -1; }
++    if (position < 0) { errno = 22; return -1; }
++    archivePushback = EOF;
++    archiveEnd = false;
++    SyncUnlockedStatus();
++    return 0;
++}
+diff --git a/core/libs/prx/libc/src/ArchiveScanning.cpp b/core/libs/prx/libc/src/ArchiveScanning.cpp
+new file mode 100644
+index 0000000000..ef267cdb25
+--- /dev/null
++++ b/core/libs/prx/libc/src/ArchiveScanning.cpp
+@@ -0,0 +1,219 @@
++#include "prx/libc/include/ArchiveStdio.hpp"
++#include "prx/libc/include/FileStream.hpp"
++#include "prx/libc/include/General.hpp"
++#include "prx/libc/include/GuestArena.hpp"
++
++#include <array>
++#include <cctype>
++#include <clocale>
++#include <cstring>
++#include <limits>
++#include <string>
++
++namespace {
++
++class FieldReader {
++    FileStream* stream;
++    std::size_t limit;
++    std::size_t count = 0;
++
++public:
++    FieldReader(FileStream* file, std::size_t width) : stream(file), limit(width) {}
++    int Peek() { return count < limit ? stream->PeekArchive() : EOF; }
++    int Take() {
++        unsigned char value = 0;
++        if (count >= limit || stream->ReadArchive(&value, 1) != 1) return EOF;
++        ++count;
++        return value;
++    }
++    std::size_t Count() const { return count; }
++};
++
++void PutCharacter(char* target, char value) {
++    const GuestArena::HostWrite destination(target, 1);
++    if (!destination.Open()) throw std::runtime_error("archive scanf: buffer is not writable");
++    *target = value;
++}
++
++bool Digit(int value, unsigned base) {
++    if (value >= '0' && value <= '9') return static_cast<unsigned>(value - '0') < base;
++    return base == 16 && ((value >= 'a' && value <= 'f') || (value >= 'A' && value <= 'F'));
++}
++
++void Append(FieldReader& input, std::string& token) {
++    if (token.size() >= 4096) NotImplemented_nid_no_patch("archive scanf numeric field longer than 4096 bytes");
++    token.push_back(static_cast<char>(input.Take()));
++}
++
++bool Word(FieldReader& input, std::string& token, const char* word) {
++    for (; *word; ++word) {
++        if (std::tolower(input.Peek()) != *word) return false;
++        Append(input, token);
++    }
++    return true;
++}
++
++bool Integer(FieldReader& input, std::string& token, char conversion) {
++    if (input.Peek() == '+' || input.Peek() == '-') Append(input, token);
++    unsigned base = conversion == 'o' ? 8 : conversion == 'x' || conversion == 'X' || conversion == 'p' ? 16 : 10;
++    bool digits = false;
++    if (input.Peek() == '0') {
++        Append(input, token);
++        digits = true;
++        if (conversion == 'i') base = 8;
++        if ((base == 16 || conversion == 'i') && (input.Peek() == 'x' || input.Peek() == 'X')) {
++            Append(input, token);
++            base = 16;
++            digits = false;
++        }
++    }
++    while (Digit(input.Peek(), base)) { Append(input, token); digits = true; }
++    return digits;
++}
++
++bool Floating(FieldReader& input, std::string& token) {
++    if (input.Peek() == '+' || input.Peek() == '-') Append(input, token);
++    if (std::tolower(input.Peek()) == 'i') {
++        if (!Word(input, token, "inf")) return false;
++        return std::tolower(input.Peek()) != 'i' || Word(input, token, "inity");
++    }
++    if (std::tolower(input.Peek()) == 'n') return Word(input, token, "nan");
++    unsigned base = 10;
++    bool digits = false;
++    if (input.Peek() == '0') {
++        Append(input, token);
++        digits = true;
++        if (input.Peek() == 'x' || input.Peek() == 'X') {
++            Append(input, token);
++            base = 16;
++            digits = false;
++        }
++    }
++    while (Digit(input.Peek(), base)) { Append(input, token); digits = true; }
++    if (input.Peek() == '.') {
++        Append(input, token);
++        while (Digit(input.Peek(), base)) { Append(input, token); digits = true; }
++    }
++    if (!digits) return false;
++    const int exponent = base == 16 ? 'p' : 'e';
++    if (std::tolower(input.Peek()) != exponent) return true;
++    Append(input, token);
++    if (input.Peek() == '+' || input.Peek() == '-') Append(input, token);
++    digits = false;
++    while (Digit(input.Peek(), 10)) { Append(input, token); digits = true; }
++    return digits;
++}
++
++std::array<bool, 256> Scanset(const char* specifier) {
++    std::array<bool, 256> values{};
++    const auto* cursor = reinterpret_cast<const unsigned char*>(specifier + 1);
++    const bool inverse = *cursor == '^';
++    if (inverse) ++cursor;
++    if (*cursor == ']') values[*cursor++] = true;
++    while (*cursor && *cursor != ']') {
++        const unsigned char first = *cursor++;
++        if (*cursor == '-' && cursor[1] && cursor[1] != ']' && first <= cursor[1]) {
++            const unsigned char last = cursor[1];
++            cursor += 2;
++            for (unsigned value = first; value <= last; ++value) values[value] = true;
++        } else values[first] = true;
++    }
++    if (inverse) for (auto& value : values) value = !value;
++    return values;
++}
++
++}
++
++void RequireArchiveScan_nid_no_patch(const char* format) {
++    for (const char* cursor = format; *cursor;) {
++        if (*cursor++ != '%') continue;
++        if (*cursor == '%') { ++cursor; continue; }
++        if (*cursor == '*') ++cursor;
++        unsigned width = 0;
++        const bool hasWidth = std::isdigit(static_cast<unsigned char>(*cursor)) != 0;
++        while (std::isdigit(static_cast<unsigned char>(*cursor))) {
++            const auto digit = static_cast<unsigned>(*cursor++ - '0');
++            if (width > (static_cast<unsigned>(std::numeric_limits<int>::max()) - digit) / 10)
++                NotImplemented_nid_no_patch("archive scanf width exceeds INT_MAX");
++            width = width * 10 + digit;
++        }
++        if (hasWidth && width == 0) NotImplemented_nid_no_patch("archive scanf zero field width");
++        const char* start = cursor;
++        while (*cursor && std::strchr("hljztL", *cursor)) ++cursor;
++        const std::string length(start, cursor);
++        const char conversion = *cursor;
++        if (!conversion || !std::strchr("diouxXnpaAeEfFgGsc[", conversion))
++            NotImplemented_nid_no_patch("archive scanf positional, allocation or unknown conversion");
++        const bool number = std::strchr("diouxXn", conversion) != nullptr;
++        const bool floating = std::strchr("aAeEfFgG", conversion) != nullptr;
++        const bool valid = number ? length.empty() || length == "hh" || length == "h" || length == "l" || length == "ll" || length == "j" || length == "z" || length == "t"
++            : floating ? length.empty() || length == "l" || length == "L" : length.empty();
++        if (!valid) NotImplemented_nid_no_patch("archive scanf wide conversion or unsupported length");
++        if (floating && std::strcmp(std::localeconv()->decimal_point, ".") != 0)
++            NotImplemented_nid_no_patch("archive scanf non-dot decimal locale");
++#ifdef _WIN32
++        if (floating && length == "L") NotImplemented_nid_no_patch("archive scanf 80-bit long double on Windows");
++#endif
++        ++cursor;
++        if (conversion == '[') {
++            if (*cursor == '^') ++cursor;
++            if (*cursor == ']') ++cursor;
++            while (*cursor && *cursor != ']') ++cursor;
++            if (!*cursor) NotImplemented_nid_no_patch("archive scanf unterminated scanset");
++            ++cursor;
++        }
++    }
++}
++
++int ScanArchiveField_nid_no_patch(FileStream* stream, const char* directive, bool suppress, void* target, int* consumed) {
++    const char* cursor = directive + 1;
++    if (*cursor == '*') ++cursor;
++    std::size_t width = 0;
++    while (std::isdigit(static_cast<unsigned char>(*cursor))) {
++        const auto digit = static_cast<unsigned>(*cursor++ - '0');
++        if (width > (std::numeric_limits<std::size_t>::max() - digit) / 10) throw std::invalid_argument("archive scanf width overflow");
++        width = width * 10 + digit;
++    }
++    const char* lengthStart = cursor;
++    while (*cursor && std::strchr("hljztL", *cursor)) ++cursor;
++    const std::string length(lengthStart, cursor);
++    const char conversion = *cursor;
++    if (conversion == 'S' || conversion == 'C' || ((conversion == 's' || conversion == 'c' || conversion == '[') && !length.empty()))
++        NotImplemented_nid_no_patch("archive scanf wide character conversion");
++    if (!std::strchr("diouxXpaAeEfFgGsc[", conversion) || conversion == '\0')
++        NotImplemented_nid_no_patch("archive scanf conversion");
++    if (length != "" && length != "hh" && length != "h" && length != "l" && length != "ll" && length != "j" && length != "z" && length != "t" && length != "L")
++        NotImplemented_nid_no_patch("archive scanf length modifier");
++    const auto limit = width != 0 ? width : conversion == 'c' ? 1 : static_cast<std::size_t>(std::numeric_limits<int>::max());
++    FieldReader input(stream, limit);
++    const bool empty = input.Peek() == EOF;
++    if (conversion == 's' || conversion == 'c' || conversion == '[') {
++        const auto set = conversion == '[' ? Scanset(cursor) : std::array<bool, 256>{};
++        auto* output = static_cast<char*>(target);
++        while (input.Peek() != EOF) {
++            const int next = input.Peek();
++            if ((conversion == 's' && std::isspace(next)) || (conversion == '[' && !set[static_cast<unsigned char>(next)])) break;
++            const int value = input.Take();
++            if (value == EOF) break;
++            if (!suppress) PutCharacter(output++, static_cast<char>(value));
++        }
++        if (input.Count() == 0) return empty ? EOF : 0;
++        if (!suppress && conversion != 'c') PutCharacter(output, '\0');
++        *consumed = static_cast<int>(input.Count());
++        return suppress ? 0 : 1;
++    }
++    std::string token;
++    const bool valid = std::strchr("aAeEfFgG", conversion) ? Floating(input, token)
++        : conversion == 'p' && input.Peek() == '(' ? Word(input, token, "(nil)") : Integer(input, token, conversion);
++    if (!valid) return empty ? EOF : 0;
++    const std::size_t targetSize = conversion == 'p' ? sizeof(void*) : std::strchr("aAeEfFgG", conversion)
++        ? length == "L" ? sizeof(long double) : length == "l" ? sizeof(double) : sizeof(float)
++        : length == "hh" ? 1 : length == "h" ? sizeof(short) : length.empty() ? sizeof(int) : sizeof(std::int64_t);
++    const GuestArena::HostWrite destination(target, suppress ? 0 : targetSize);
++    if (!suppress && !destination.Open()) throw std::runtime_error("archive scanf: target is not writable");
++    int hostConsumed = -1;
++    const int result = suppress ? std::sscanf(token.c_str(), directive, &hostConsumed) : std::sscanf(token.c_str(), directive, target, &hostConsumed);
++    if (hostConsumed < 0 || static_cast<std::size_t>(hostConsumed) != token.size()) return 0;
++    *consumed = static_cast<int>(input.Count());
++    return result;
++}
+diff --git a/core/libs/tests/GuestArchiveStdio.cpp b/core/libs/tests/GuestArchiveStdio.cpp
+new file mode 100644
+index 0000000000..56f2107be3
+--- /dev/null
++++ b/core/libs/tests/GuestArchiveStdio.cpp
+@@ -0,0 +1,360 @@
++#include "prx/libc/include/Api.hpp"
++#include "prx/libc/include/AppArchive.hpp"
++#include "prx/libc/include/FileStream.hpp"
++#include "prx/libc/include/General.hpp"
++#include "prx/libkernel/include/Api.hpp"
++#include "prx/libkernel/File/include/FileFlags.hpp"
++#include "prx/libkernel/File/include/File.hpp"
++#include "AppArchiveFixture.hpp"
++
++#include <algorithm>
++#include <array>
++#include <cerrno>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <limits>
++#include <stdexcept>
++#include <string>
++#include <thread>
++#include <vector>
++
++namespace {
++
++void Require(bool value, int line) {
++    if (!value) {
++        std::fprintf(stderr, "archive stdio check failed at line %d, errno %d\n", line, errno);
++        std::exit(1);
++    }
++}
++#define Check(value) Require((value), __LINE__)
++
++constexpr std::size_t BigSize = 3 * 65536 + 77;
++
++void Prefix(FileStream* stream) {
++    const auto* prefix = reinterpret_cast<const GuestFilePrefix*>(stream);
++    Check(prefix->position == nullptr && prefix->readRemaining == 0 && prefix->writeRemaining == 0);
++    Check(prefix->buffer == nullptr && prefix->bufferSize == 0 && (prefix->flags & 4) != 0);
++    const auto* reserved = reinterpret_cast<const unsigned char*>(stream) + sizeof(GuestFilePrefix);
++    Check(std::all_of(reserved, reinterpret_cast<const unsigned char*>(stream) + 256, [](unsigned char value) { return value == 0; }));
++}
++
++template <typename TCall>
++void Refused(TCall call) {
++    bool refused = false;
++    try { call(); }
++    catch (const std::runtime_error& error) { refused = std::strstr(error.what(), "not implemented") != nullptr; }
++    Check(refused);
++}
++
++void Reads() {
++    auto* root = fopen_nid_postfix("/app0/param.sfx", "rb");
++    Check(root != nullptr && root->IsArchive());
++    char rootBytes[8]{};
++    Check(fread_nid_postfix(rootBytes, 1, sizeof(rootBytes), root) == sizeof(rootBytes) && std::memcmp(rootBytes, "ROOTSFX!", 8) == 0);
++    Check(fclose_nid_postfix(root) == 0);
++    auto* hero = fopen_nid_postfix("/app0/data/prein/effects/odx/hero_respawn_icon_01.odx", "rb");
++    Check(hero != nullptr && hero->IsArchive());
++    const auto heroExpected = AppArchiveFixture::Pattern(131077);
++    std::vector<char> heroBytes(heroExpected.size());
++    Check(fread_nid_postfix(heroBytes.data(), 1, heroBytes.size(), hero) == heroExpected.size() && heroBytes == heroExpected);
++    Check(fclose_nid_postfix(hero) == 0);
++    auto* stream = fopen_nid_postfix("/app0/sce_sys/param.sfx", "rb");
++    Check(stream != nullptr && stream->IsArchive());
++    Prefix(stream);
++    const int descriptor = fileno_nid_postfix(stream);
++    Check(descriptor >= 0 && fileno_unlocked_nid_postfix(stream) == descriptor);
++    char bytes[32]{};
++    Check(fread_nid_postfix(bytes, 2, 4, stream) == 4 && std::memcmp(bytes, "PARAMSFX", 8) == 0);
++    Check(ftell_nid_postfix(stream) == 8 && feof_nid_postfix(stream) == 0);
++    std::int64_t position = -1;
++    Check(fgetpos_nid_postfix(stream, &position) == 0 && position == 8);
++    Check(fread_nid_postfix(bytes, 2, 4, stream) == 1 && std::memcmp(bytes, "\0\xff\n", 3) == 0);
++    Check(ftell_nid_postfix(stream) == 11 && feof_nid_postfix(stream) != 0 && ferror_nid_postfix(stream) == 0);
++    Check(fflush_nid_postfix(stream) == 0 && feof_nid_postfix(stream) != 0);
++    Check(fread_nid_postfix(nullptr, 0, 1, stream) == 0 && feof_nid_postfix(stream) != 0);
++    Check(ungetc_nid_postfix(0xff, stream) == 0xff && feof_unlocked_nid_postfix(stream) == 0);
++    Check(ftell_nid_postfix(stream) == 10 && getc_unlocked_nid_postfix(stream) == 0xff);
++    Check(fgetc_nid_postfix(stream) == EOF && feof_nid_postfix(stream) != 0);
++    clearerr_unlocked_nid_postfix(stream);
++    Check(feof_nid_postfix(stream) == 0 && ferror_unlocked_nid_postfix(stream) == 0);
++    Check(fsetpos_nid_postfix(stream, &position) == 0 && ftello_nid_postfix(stream) == 8);
++    Check(getc_nid_postfix(stream) == 0 && __srget_nid_postfix(stream) == 255);
++    Check(fseek_nid_postfix(stream, -3, SEEK_CUR) == 0 && ftell_nid_postfix(stream) == 7);
++    Check(fseeko_nid_postfix(stream, 100, SEEK_END) == 0 && ftell_nid_postfix(stream) == 111);
++    Check(fgetc_nid_postfix(stream) == EOF && feof_nid_postfix(stream) != 0);
++    Check(fseek_nid_postfix(stream, -1, SEEK_SET) == -1 && errno == 22 && ftell_nid_postfix(stream) == 111);
++    Check(fseek_nid_postfix(stream, std::numeric_limits<std::int64_t>::max(), SEEK_CUR) == -1 && errno == 22);
++    Check(fseek_nid_postfix(stream, 0, 99) == -1 && errno == 22);
++    rewind_nid_postfix(stream);
++    Check(ftell_nid_postfix(stream) == 0 && feof_nid_postfix(stream) == 0);
++    Check(fread_nid_postfix(bytes, std::numeric_limits<std::size_t>::max(), 2, stream) == 0 && errno == 22);
++    Check(ferror_nid_postfix(stream) != 0 && ftell_nid_postfix(stream) == 0);
++    clearerr_nid_postfix(stream);
++    Check(fwrite_nid_postfix("x", 1, 1, stream) == 0 && errno == 9 && ferror_nid_postfix(stream) != 0);
++    Check(fputc_nid_postfix('x', stream) == EOF && putc_unlocked_nid_postfix('x', stream) == EOF);
++    Check(fputs_nid_postfix("x", stream) == EOF && fprintf_nid_postfix(stream, "%s", "x") == EOF);
++    Check(ftell_nid_postfix(stream) == 0);
++    clearerr_nid_postfix(stream);
++    Check(ungetc_nid_postfix('Q', stream) == 'Q' && ungetc_nid_postfix('R', stream) == EOF);
++    Check(fpurge_nid_postfix(stream) == 0 && fgetc_nid_postfix(stream) == 'P');
++    Refused([&] { (void)GetNativeStream(stream); });
++    Check(setvbuf_nid_postfix(stream, nullptr, 2, 0) == 0);
++    setbuf_nid_postfix(stream, nullptr);
++    Refused([&] { (void)setvbuf_nid_postfix(stream, nullptr, 0, 4096); });
++    Refused([&] { (void)setvbuf_nid_postfix(stream, nullptr, 1, 4096); });
++    Check(setvbuf_nid_postfix(stream, nullptr, 99, 0) == -1 && errno == 22);
++    Check(fclose_nid_postfix(stream) == 0 && !AppArchiveDescriptor_nid_no_patch(descriptor, nullptr, nullptr));
++
++    stream = fopen_nid_postfix("/app0/Data/Big.bin", "r");
++    Check(stream != nullptr);
++    std::vector<char> big(BigSize + 19);
++    const auto expected = AppArchiveFixture::Pattern(BigSize);
++    Check(fread_nid_postfix(big.data(), 1, big.size(), stream) == BigSize);
++    Check(std::equal(expected.begin(), expected.end(), big.begin()) && feof_nid_postfix(stream) != 0);
++    Check(fclose_nid_postfix(stream) == 0);
++}
++
++void Lines() {
++    auto* stream = fopen_nid_postfix("/app0/Data/Lines.txt", "r");
++    Check(stream != nullptr);
++    char line[16]{};
++    Check(fgets_nid_postfix(line, 1, stream) == line && line[0] == 0 && ftell_nid_postfix(stream) == 0);
++    Check(fgets_nid_postfix(line, 4, stream) == line && std::strcmp(line, "one") == 0);
++    Check(fgets_nid_postfix(line, sizeof(line), stream) == line && std::strcmp(line, "\n") == 0);
++    Check(fgets_nid_postfix(line, sizeof(line), stream) == line && std::strcmp(line, "two") == 0 && feof_nid_postfix(stream) != 0);
++    Check(fgets_nid_postfix(line, sizeof(line), stream) == nullptr);
++    Check(fgets_nid_postfix(line, 0, stream) == nullptr && errno == 22 && ferror_nid_postfix(stream) != 0);
++    rewind_nid_postfix(stream);
++    Check(ferror_nid_postfix(stream) == 0 && getc_nid_postfix(stream) == 'o');
++    Check(ungetc_nid_postfix('X', stream) == 'X' && ftell_nid_postfix(stream) == 0);
++    Check(fflush_nid_postfix(stream) == 0 && ftell_nid_postfix(stream) == 0 && fgetc_nid_postfix(stream) == 'o');
++    Check(fclose_nid_postfix(stream) == 0);
++    stream = fopen_nid_postfix("/app0/Data/Empty", "r");
++    Check(stream != nullptr && feof_nid_postfix(stream) == 0 && fgetc_nid_postfix(stream) == EOF && feof_nid_postfix(stream) != 0);
++    Check(fclose_nid_postfix(stream) == 0);
++}
++
++void Scanning() {
++    auto* stream = fopen_nid_postfix("/app0/Data/Scan.txt", "r");
++    Check(stream != nullptr);
++    int decimal = 0, hex = 0, automatic = 0, count = -1;
++    double real = 0;
++    char word[16]{}, set[16]{}, characters[3]{};
++    Check(fscanf_nid_postfix(stream, "%d %x %i %lf %15s %15[a-z]%n", &decimal, &hex, &automatic, &real, word, set, &count) == 6);
++    Check(decimal == -42 && hex == 0x2a && automatic == 63 && real == 12.5 && std::strcmp(word, "word") == 0 && std::strcmp(set, "abc") == 0);
++    Check(ftell_nid_postfix(stream) == count && fgetc_nid_postfix(stream) == '!');
++    Check(fscanf_nid_postfix(stream, "%*d %2c", characters) == 1 && std::memcmp(characters, "XY", 2) == 0);
++    Check(fscanf_nid_postfix(stream, "%d", &decimal) == 0 && fgetc_nid_postfix(stream) == 'z');
++    Check(fscanf_nid_postfix(stream, "%d", &decimal) == EOF);
++    rewind_nid_postfix(stream);
++    Check(fscanf_s_nid_postfix(stream, "%d %x %i %lf %s", &decimal, &hex, &automatic, &real, word, static_cast<unsigned>(sizeof(word))) == 5);
++    Refused([&] { (void)fscanf_nid_postfix(stream, "%ls", word); });
++    Refused([&] { (void)fscanf_nid_postfix(stream, "%1$d", &decimal); });
++    Refused([&] { (void)fwscanf_nid_postfix(stream, u"%d", &decimal); });
++    Refused([&] { (void)fwscanf_s_nid_postfix(stream, u"%d", &decimal); });
++    Check(fclose_nid_postfix(stream) == 0);
++    stream = fopen_nid_postfix("/app0/Data/Incomplete.txt", "r");
++    Check(stream != nullptr && fscanf_nid_postfix(stream, "%lf", &real) == 0 && ftell_nid_postfix(stream) == 4);
++    Check(fgetc_nid_postfix(stream) == 'X');
++    Check(fclose_nid_postfix(stream) == 0);
++    stream = fopen_nid_postfix("/app0/Data/Numeric.txt", "r");
++    unsigned number = 0;
++    float single = 0, hexadecimal = 0;
++    Check(stream != nullptr && fscanf_nid_postfix(stream, "%u %f %a%n", &number, &single, &hexadecimal, &count) == 3);
++    Check(number == 42 && single == 3.5f && hexadecimal == 6.0f && count == 15 && ftell_nid_postfix(stream) == 15);
++    rewind_nid_postfix(stream);
++    Check(fscanf_nid_postfix(stream, "%1u", &number) == 1 && number == 4 && fgetc_nid_postfix(stream) == '2');
++    Refused([&] { (void)fscanf_nid_postfix(stream, "%2147483648s", word); });
++    Refused([&] { (void)fscanf_nid_postfix(stream, "%ms", word); });
++    Refused([&] { (void)fscanf_nid_postfix(stream, "%0s", word); });
++    Check(ftell_nid_postfix(stream) == 2);
++    Check(fclose_nid_postfix(stream) == 0);
++    stream = fopen_nid_postfix("/app0/Data/Text.txt", "r");
++    Check(stream != nullptr && fscanf_nid_postfix(stream, "[%3[^]]] %*2c%1c %2s%n", set, characters, word, &count) == 3);
++    Check(std::strcmp(set, "abc") == 0 && characters[0] == 'Z' && std::strcmp(word, "wo") == 0 && count == 12);
++    Check(fgetc_nid_postfix(stream) == 'r');
++    Check(fclose_nid_postfix(stream) == 0);
++    stream = fopen_nid_postfix("/app0/Data/LongNumeric.txt", "r");
++    Check(stream != nullptr);
++    Refused([&] { (void)fscanf_nid_postfix(stream, "%d", &decimal); });
++    Check(ftell_nid_postfix(stream) == 4096 && fgetc_nid_postfix(stream) == '1');
++    Check(fclose_nid_postfix(stream) == 0);
++    stream = fopen_nid_postfix("/app0/Data/LongString.txt", "r");
++    std::vector<char> longWord(8193);
++    Check(stream != nullptr && fscanf_nid_postfix(stream, "%8192s%n", longWord.data(), &count) == 1 && count == 8192);
++    Check(std::all_of(longWord.begin(), longWord.end() - 1, [](char value) { return value == 's'; }) && longWord.back() == 0);
++    Check(fclose_nid_postfix(stream) == 0);
++}
++
++void SharedDescriptors() {
++    const int descriptor = sceKernelOpen("/app0/sce_sys/param.sfx", SCE_KERNEL_O_RDONLY, 0);
++    Check(descriptor >= 0);
++    Check(fdopen_nid_postfix(descriptor, "r+") == nullptr && errno == 9);
++    Check(fdopen_nid_postfix(descriptor, "bad") == nullptr && errno == 22);
++    char bytes[16]{};
++    Check(sceKernelRead(descriptor, bytes, 2) == 2 && std::memcmp(bytes, "PA", 2) == 0);
++    const int duplicate = dup_nid_postfix(descriptor);
++    Check(duplicate >= 0);
++    auto* stream = fdopen_nid_postfix(descriptor, "rb");
++    Check(stream != nullptr && stream->IsArchive() && fileno_nid_postfix(stream) == descriptor);
++    Check(fread_nid_postfix(bytes, 1, 3, stream) == 3 && std::memcmp(bytes, "RAM", 3) == 0);
++    Check(sceKernelLseek(duplicate, 0, SEEK_CUR) == 5);
++    Check(sceKernelRead(duplicate, bytes, 2) == 2 && std::memcmp(bytes, "SF", 2) == 0 && ftell_nid_postfix(stream) == 7);
++    Check(fseek_nid_postfix(stream, 0, SEEK_SET) == 0 && sceKernelLseek(duplicate, 0, SEEK_CUR) == 0);
++    Check(fgetc_nid_postfix(stream) == 'P' && sceKernelLseek(duplicate, 0, SEEK_CUR) == 1);
++    Check(fclose_nid_postfix(stream) == 0 && !AppArchiveDescriptor_nid_no_patch(descriptor, nullptr, nullptr));
++    Check(sceKernelRead(duplicate, bytes, 2) == 2 && std::memcmp(bytes, "AR", 2) == 0);
++    Check(sceKernelClose(duplicate) == 0);
++    const int plain = sceKernelOpen("/app0/Loose.txt", SCE_KERNEL_O_RDONLY, 0);
++    Check(plain >= 0 && !AppArchiveDescriptor_nid_no_patch(plain, nullptr, nullptr));
++    Check(sceKernelRead(plain, bytes, sizeof(bytes)) == 4 && std::memcmp(bytes, "disk", 4) == 0);
++    Check(sceKernelClose(plain) == 0);
++
++    stream = fopen_nid_postfix("/app0/Data/Scan.txt", "r");
++    Check(stream != nullptr);
++    int value = 0;
++    Check(fscanf_nid_postfix(stream, "%d", &value) == 1 && value == -42);
++    Check(sceKernelLseek(fileno_nid_postfix(stream), 0, SEEK_CUR) == ftell_nid_postfix(stream));
++    Check(sceKernelRead(fileno_nid_postfix(stream), bytes, 1) == 1 && bytes[0] == ' ');
++    Check(fclose_nid_postfix(stream) == 0);
++
++    stream = fopen_nid_postfix("/app0/Loose.txt", "rb");
++    Check(stream != nullptr && setvbuf_nid_postfix(stream, nullptr, 2, 0) == 0);
++    const int replaced = fileno_nid_postfix(stream);
++    const int source = sceKernelOpen("/app0/param.sfx", SCE_KERNEL_O_RDONLY, 0);
++    Check(source >= 0 && dup2_nid_postfix(source, replaced) == replaced);
++    Check(fgetc_nid_postfix(stream) == 'R' && stream->IsArchive() && sceKernelLseek(source, 0, SEEK_CUR) == 1);
++    const int native = sceKernelOpen("/app0/Loose.txt", SCE_KERNEL_O_RDONLY, 0);
++    Check(native >= 0 && dup2_nid_postfix(native, replaced) == replaced);
++    Check(fgetc_nid_postfix(stream) == 'd' && !stream->IsArchive());
++    Check(dup2_nid_postfix(source, replaced) == replaced);
++    Check(fclose_nid_postfix(stream) == 0 && !AppArchiveDescriptor_nid_no_patch(replaced, nullptr, nullptr));
++    Check(sceKernelClose(source) == 0 && sceKernelClose(native) == 0);
++}
++
++void OpensAndReopens() {
++    char bytes[16]{};
++    auto* stream = fopen_nid_postfix("/app0/loose.TXT", "rb");
++    Check(stream != nullptr && !stream->IsArchive());
++    Check(fread_nid_postfix(bytes, 1, sizeof(bytes), stream) == 4 && std::memcmp(bytes, "disk", 4) == 0);
++    Check(freopen_nid_postfix("/app0/sce_sys/param.sfx", "rb", stream) == stream && stream->IsArchive());
++    const int archived = fileno_nid_postfix(stream);
++    Check(fgetc_nid_postfix(stream) == 'P');
++    Check(freopen_nid_postfix("/app0/Data/Lines.txt", "r", stream) == stream && fgetc_nid_postfix(stream) == 'o');
++    Check(freopen_nid_postfix("/app0/Loose.txt", "rb", stream) == stream && !stream->IsArchive());
++    Check(!AppArchiveDescriptor_nid_no_patch(archived, nullptr, nullptr));
++    Check(fgetc_nid_postfix(stream) == 'd' && fclose_nid_postfix(stream) == 0);
++    Check(fopen_nid_postfix("/app0/Data/Empty", "r+") == nullptr && errno == 30);
++    Check(fopen_nid_postfix("/app0/Data/Empty", "w") == nullptr && errno == 30);
++    Check(fopen_nid_postfix("/app0/Data/Empty", "a") == nullptr && errno == 30);
++    Check(fopen_nid_postfix("/app0/Data/Empty", "wx") == nullptr && errno == 17);
++    Check(fopen_nid_postfix("/app0/Data", "r") == nullptr && errno == 21);
++    Check(fopen_nid_postfix("/app0/Data/Missing", "r") == nullptr && errno == 2);
++    stream = fopen_nid_postfix("/app0/Data/Lines.txt", "r");
++    Check(stream != nullptr);
++    const int descriptor = fileno_nid_postfix(stream);
++    Check(freopen_nid_postfix("/app0/Data/Empty", "w", stream) == nullptr && errno == 30);
++    Check(!AppArchiveDescriptor_nid_no_patch(descriptor, nullptr, nullptr));
++    stream = fopen_nid_postfix("/app0/param.sfx", "rb");
++    Check(stream != nullptr && freopen_nid_postfix("/dev/urandom", "rb", stream) == stream && stream->IsRandomDevice());
++    Check(fread_nid_postfix(bytes, 1, sizeof(bytes), stream) == sizeof(bytes) && feof_nid_postfix(stream) == 0);
++    Check(fclose_nid_postfix(stream) == 0);
++#ifdef _WIN32
++    stream = fopen_nid_postfix("/app0/param.sfx", "rb");
++    Check(stream != nullptr && freopen_nid_postfix("/app0/sce_sys", "rb", stream) == stream && stream->IsDirectory());
++    Check(fread_nid_postfix(bytes, 1, sizeof(bytes), stream) == 0 && ferror_nid_postfix(stream) != 0);
++    Check(fclose_nid_postfix(stream) == 0);
++#endif
++    std::error_code error;
++    Check(!std::filesystem::exists("app0/sce_sys/param.sfx", error));
++}
++
++void ConcurrentReads() {
++    auto* stream = fopen_nid_postfix("/app0/Loose.txt", "rb");
++    Check(stream != nullptr && setvbuf_nid_postfix(stream, nullptr, 2, 0) == 0);
++    const int descriptor = sceKernelOpen("/app0/Data/Big.bin", SCE_KERNEL_O_RDONLY, 0);
++    const int target = fileno_nid_postfix(stream);
++    Check(descriptor >= 0 && dup2_nid_postfix(descriptor, target) == target);
++    std::array<std::vector<char>, 4> parts;
++    std::vector<std::thread> threads;
++    for (auto& part : parts) threads.emplace_back([&, output = &part] {
++        for (;;) {
++            const int value = fgetc_nid_postfix(stream);
++            if (value == EOF) break;
++            output->push_back(static_cast<char>(value));
++        }
++    });
++    for (auto& thread : threads) thread.join();
++    std::array<std::size_t, 256> actual{}, expected{};
++    for (const auto& part : parts) for (unsigned char value : part) ++actual[value];
++    for (unsigned char value : AppArchiveFixture::Pattern(BigSize)) ++expected[value];
++    Check(actual == expected && ftell_nid_postfix(stream) == static_cast<std::int64_t>(BigSize) && ferror_nid_postfix(stream) == 0);
++    Check(fclose_nid_postfix(stream) == 0 && !AppArchiveDescriptor_nid_no_patch(target, nullptr, nullptr));
++    Check(sceKernelLseek(descriptor, 0, SEEK_CUR) == static_cast<std::int64_t>(BigSize) && sceKernelClose(descriptor) == 0);
++}
++
++}
++
++int main(int argc, char** argv) {
++    if (argc != 2) return 2;
++    const auto root = AppArchiveFixture::EnterFreshRoot("anyps5-archive-stdio");
++    { std::ofstream loose(root / "app0" / "Loose.txt"); loose << "disk"; }
++    const std::string mode = argv[1];
++    if (mode == "archive") {
++        const std::string scan = " -42 0x2a 077 12.5 word abc! 99 XYz";
++        AppArchiveFixture::WriteArchive(root / "app0.zar", {
++            {"sce_sys/param.sfx", {'P', 'A', 'R', 'A', 'M', 'S', 'F', 'X', '\0', static_cast<char>(0xff), '\n'}},
++            {"param.sfx", {'R', 'O', 'O', 'T', 'S', 'F', 'X', '!'}},
++            {"Data/Big.bin", AppArchiveFixture::Pattern(BigSize)},
++            {"data/prein/effects/odx/hero_respawn_icon_01.odxb", AppArchiveFixture::Pattern(131077)},
++            {"Data/Numeric.txt", {'4', '2', ' ', '3', '.', '5', ' ', '0', 'x', '1', '.', '8', 'p', '+', '2'}},
++            {"Data/Text.txt", {'[', 'a', 'b', 'c', ']', ' ', 'X', 'Y', 'Z', ' ', 'w', 'o', 'r', 'd'}},
++            {"Data/LongNumeric.txt", std::vector<char>(4097, '1')},
++            {"Data/LongString.txt", std::vector<char>(8192, 's')},
++            {"Data/Lines.txt", {'o', 'n', 'e', '\n', 't', 'w', 'o'}},
++            {"Data/Scan.txt", std::vector<char>(scan.begin(), scan.end())},
++            {"Data/Incomplete.txt", {'1', '0', '0', 'e', 'X'}},
++            {"Data/Empty", {}},
++            {"Loose.txt", {'z', 'a', 'r'}}
++        });
++        Reads();
++        Lines();
++        Scanning();
++        SharedDescriptors();
++        OpensAndReopens();
++        ConcurrentReads();
++    } else if (mode == "damaged") {
++        AppArchiveFixture::WriteArchive(root / "app0.zar", {{"param.sfx", AppArchiveFixture::Pattern(65536)}});
++        {
++            std::fstream archive(root / "app0.zar", std::ios::binary | std::ios::in | std::ios::out);
++            const char garbage[8] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0};
++            archive.write(garbage, sizeof(garbage));
++        }
++        auto* stream = fopen_nid_postfix("/app0/param.sfx", "rb");
++        Check(stream != nullptr && stream->IsArchive());
++        char bytes[32]{};
++        Check(fread_nid_postfix(bytes, 1, sizeof(bytes), stream) == 0 && errno == 5);
++        Check(ferror_nid_postfix(stream) != 0 && feof_nid_postfix(stream) == 0 && ftell_nid_postfix(stream) == 0);
++        clearerr_nid_postfix(stream);
++        Check(fgetc_nid_postfix(stream) == EOF && errno == 5 && ferror_nid_postfix(stream) != 0 && feof_nid_postfix(stream) == 0);
++        clearerr_nid_postfix(stream);
++        int value = 0;
++        Check(fscanf_nid_postfix(stream, "%d", &value) == EOF && errno == 5 && ferror_nid_postfix(stream) != 0 && feof_nid_postfix(stream) == 0);
++        const int descriptor = fileno_nid_postfix(stream);
++        Check(fclose_nid_postfix(stream) == 0 && !AppArchiveDescriptor_nid_no_patch(descriptor, nullptr, nullptr));
++    } else if (mode == "plain") {
++        auto* stream = fopen_nid_postfix("/app0/Loose.txt", "rb");
++        Check(stream != nullptr && !stream->IsArchive());
++        char bytes[8]{};
++        Check(fread_nid_postfix(bytes, 1, sizeof(bytes), stream) == 4 && std::memcmp(bytes, "disk", 4) == 0);
++        Check(fclose_nid_postfix(stream) == 0);
++        Check(fopen_nid_postfix("/app0/sce_sys/param.sfx", "r") == nullptr && errno == 2);
++    } else return 2;
++    std::error_code error;
++    std::filesystem::current_path(std::filesystem::temp_directory_path(), error);
++    std::filesystem::remove_all(root, error);
++    return 0;
++}
+diff --git a/docs/dev/debt/libc.md b/docs/dev/debt/libc.md
+index ff23d63ebf..810c9fb5d0 100644
+--- a/docs/dev/debt/libc.md
++++ b/docs/dev/debt/libc.md
+@@ -210,7 +210,7 @@
+ - [_Dtest](../../../core/libs/prx/libc/src/Math.cpp) (libc) follows Dinkumware double classification matching _FDtest: finite values return -1, subnormals -2, zeros 0, infinities 1, and NaNs 2.
+ - [_Exp and _FExp](../../../core/libs/prx/libc/src/DinkumwareInternals.cpp) (libc) - signaling NaNs, directed rounding and flush-to-zero modes are unverified, and titles whose `libc.prx` contracts multiply-adds to FMA, such as PPSA13934, differ by one unit in the last place on 889 `_FExp` and 15 `_Exp` of 300,000 random calls. Finite results use the constants, evaluation order and half-epsilon shortcut of the `libc.prx` that titles ship and match that of PPSA04158, PPSA05916, PPSA07923 and PPSA20423 on those calls, run on a Windows host. Special operands follow PRAGMATA PPSA02530's bundled `libc.prx`: the x-only cutoffs at ±229/±1842 store `0.0*y` below and `y*inf` with overflow above, ignoring the offset; a zero multiplier keeps its sign, a NaN multiplier leaves `*px` unchanged, and `+inf` with zero or `-inf` with infinity is invalid.
+ - [exp2f](../../../core/libs/prx/libc/src/Math.cpp) (libc) is FreeBSD msun's [`s_exp2f.c`](https://github.com/freebsd/freebsd-src/blob/release/11.4.0/lib/msun/src/s_exp2f.c), with `huge` and `twom100` read at run time and `x + redux` rounded to float, as msun's `volatile` reads and `STRICT_ASSIGN` do. As in the `libc.prx` that titles ship, `errno` is set to `ERANGE` only in msun's overflow (`x >= 128`) and underflow (`x <= -150`) branches, so a subnormal result leaves it unchanged. Floating-point exceptions are not compared. It gives the same bits and `errno` as the `exp2f` of the `libc.prx` bundled with PPSA07923, PPSA05916 and PPSA13934 for all 2^32 arguments, run on a Windows host.
+-- [app0.zar](../../../core/libs/prx/libc/src/AppArchive.cpp) (libc) - a [ZArchive](https://github.com/Exzap/ZArchive) beside `app0/` is a read-only layer under it: a path missing from `app0/` is looked up in the archive, case-insensitively. It is not a console format; titles ship their files in a PFS image instead. Resolving an archive-only path through any call other than the archive-aware libkernel ones throws, so `fopen`, `stat`, `access`, `opendir` and the rest do not read the archive yet, and `opendir` of a directory that exists in both places, `app0/` itself included, and `fdopen` of an archived descriptor throw instead of missing its entries or reading the null device. A damaged compressed block throws instead of returning `EIO`
++- [app0.zar](../../../core/libs/prx/libc/src/AppArchive.cpp) (libc) - a [ZArchive](https://github.com/Exzap/ZArchive) beside `app0/` is a read-only layer under it: a path missing from `app0/` is looked up in the archive, case-insensitively. It is not a console format; titles ship their files in a PFS image instead. Archive-aware `fopen`, `fdopen` and `freopen` stream bytes through the shared libkernel descriptor cursor without extraction or stdio read-ahead; loose files retain precedence and their native streams. Reads, character and line input, seek/tell/positions, status, flush/purge and descriptor exposure are adapted. There is only one byte of push-back, and only unbuffered `setvbuf` or `setbuf(nullptr)` is accepted; full and line buffering throw. Incremental narrow `fscanf` and its `_s` forms support integer/pointer and floating fields, strings, characters, scansets, literals, widths, suppression and `%n`. Numeric fields longer than 4096 bytes throw after consuming 4096; text fields stream without that limit. Wide scanning, positional/allocation or unknown conversions, malformed scansets, zero or oversized widths, unsupported lengths, floating scans in a non-dot decimal locale and Windows `%Lf` throw before input. Numeric conversion inherits host `sscanf` behavior, not a console-verified scanner. Writes are refused; unadapted native-only stream operations throw rather than reading the null-device placeholder. Generic archive-only path resolution for native-unaware consumers still throws, including `stat`, `access` and `opendir`; `opendir` also refuses directories with archive entries, including the merged `app0/` root. Damaged compressed blocks still throw through the descriptor backend, but adapted stdio reads map them to `EIO` and the stream error flag without setting EOF. Windows runtime branches and console equivalence are unverified
+ - [fopen_s](../../../core/libs/prx/libc/src/FileAndHeap.cpp) (libc) - returns the errno of the failed open, as C11 K.3.5.2.1 leaves the nonzero value open and Microsoft's CRT returns errno; the console's Dinkumware `fopen_s` is not verified
+ - [codecvt<wchar_t,char,_Mbstatet> vtable](../../../core/libs/prx/libc/src/LocaleSupport.cpp) (libc, NID `H-TDszhsYuY`) is thirteen zeroed `uintptr_t` slots matching `st_size` 104 on title `libc.prx` from PPSA26344 and on `libSceLibcInternal.sprx` (offset-to-top, typeinfo, two destructors, `_Incref`/`_Decref`, and seven conversion virtuals). Facet calls through the object fault until those methods are wired.
+ - [num_put<wchar_t> vtable](../../../core/libs/prx/libc/src/LocaleSupport.cpp) (libc, NID `59oywaaZbJk`) is fourteen zeroed `uintptr_t` slots matching `st_size` 112 on the title `libc.prx` from PPSA16833 (offset-to-top, typeinfo, two destructors, `_Incref`/`_Decref`, and eight `do_put` virtuals). Facet calls through the object fault until those methods are wired.
+--
+2.47.3

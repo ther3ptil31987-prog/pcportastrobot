@@ -12,7 +12,8 @@ Build\\Run stays the working AnyPS5 build and is only read. RunHybrid gets:
                                           the loader finds it when it resolves the forwarders)
   astrohybrid_host.dll                    AnyPS5's libAstroHybridHost.prx under the name kyty_gpu
                                           is told to load (KYTY_GPU_HOST_MODULE)
-  app0                                    junction to Game\\PPSA21567-app (read only)
+  app0                                    junction/symlink to the selected game dump (read only)
+  app0.zar                                sibling hard link/copy when the dump uses streamed data
   _sd_mem, _trophy                        copies of Build\\Run's, made once
   AstroBot-NonRT.exe                      AstroBot-NonTiled.exe plus the second change of the Kyty
                                           launcher's Candidate-NonRT game patch (GI probes and
@@ -20,13 +21,17 @@ Build\\Run stays the working AnyPS5 build and is only read. RunHybrid gets:
   u59-preset.json, u59-preset.cmd         the Kyty engine's environment preset (Jetsku int21)
   _PipelineCache                          copy of Kyty's warm pipeline cache, made once
 
-Usage: python -I Tools/hybrid/make_run_hybrid.py
+Usage: python -I Tools/hybrid/make_run_hybrid.py [--game DUMP]
+       python -I Tools/hybrid/make_run_hybrid.py --layout-only --game DUMP --output RUN
+The dump defaults to ASTROHYBRID_GAME_DUMP, then Build\\Run\\app0, then Game\\PPSA21567-app.
 """
 
+import argparse
 import os
 import pathlib
 import re
 import shutil
+import stat
 import subprocess
 import sys
 
@@ -44,7 +49,8 @@ if not (KYTY_GPU / "kyty_gpu.dll").exists() and _choice == "pgo":
     KYTY_GPU = KYTY_GPU_BUILDS["plain"]
 NIDS = KYTY / "source" / "kyty" / "src" / "hybrid" / "kytyGpuNids.inc"
 LLVM = pathlib.Path(r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\Llvm\x64\bin")
-GAME = ROOT / "Game" / "PPSA21567-app"
+GAME = pathlib.Path(os.environ.get("ASTROHYBRID_GAME_DUMP") or
+                    (RUN / "app0" if (RUN / "app0").is_dir() else ROOT / "Game" / "PPSA21567-app"))
 
 SHIMS = ("libSceAgc.prx", "libSceAgcDriver.prx", "libSceVideoOut.prx")
 FRESH = ("libc.prx", "libkernel.prx", "libScePad.prx")
@@ -75,16 +81,101 @@ HOST_FORWARDS = {
 }
 
 
+def same_file(source, target):
+    try:
+        return os.path.samefile(source, target)
+    except OSError:
+        return False
+
+
+def remove_generated_path(path):
+    """Remove a generated entry, never following symlinks or Windows junctions."""
+    path = pathlib.Path(path)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(info.st_mode):
+        path.unlink()
+    elif getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+        # lstat also sees broken junctions; removing one must not recurse into the dump.
+        if info.st_file_attributes & stat.FILE_ATTRIBUTE_DIRECTORY:
+            os.rmdir(path)
+        else:
+            path.unlink()
+    elif stat.S_ISDIR(info.st_mode):
+        for child in path.iterdir():
+            remove_generated_path(child)
+        path.rmdir()
+    else:
+        path.unlink()
+
+
 def link(source, target):
-    if target.exists():
-        if os.path.samefile(source, target):
-            return
-        target.unlink()
-    os.link(source, target)
+    source, target = pathlib.Path(source).resolve(), pathlib.Path(target)
+    if not source.is_file():
+        raise FileNotFoundError(f"missing file: {source}")
+    if same_file(source, target):
+        return
+    remove_generated_path(target)
+    try:
+        os.link(source, target)
+    except OSError:
+        # Cross-volume/network dumps cannot be hard linked. Copy only this file, not the dump.
+        shutil.copy2(source, target)
 
 
 def copy(source, target):
+    source, target = pathlib.Path(source).resolve(), pathlib.Path(target)
+    if not source.is_file():
+        raise FileNotFoundError(f"missing file: {source}")
+    if same_file(source, target):
+        return
+    # Detach old hard links/symlinks before overwriting so Build\\Run and the dump stay unchanged.
+    remove_generated_path(target)
     shutil.copy2(source, target)
+
+
+def link_directory(source, target):
+    if same_file(source, target):
+        return
+    remove_generated_path(target)
+    if os.name != "nt":
+        target.symlink_to(source, target_is_directory=True)
+        return
+    # Junctions do not need elevation; directory symlinks also support network drives.
+    for flag in ("/J", "/D"):
+        result = subprocess.run(["cmd", "/c", "mklink", flag, str(target), str(source)],
+                                capture_output=True, text=True)
+        if result.returncode == 0:
+            return
+        remove_generated_path(target)
+    raise OSError(f"Cannot link {source}: {result.stdout.strip()} {result.stderr.strip()}. "
+                  "For a network dump, enable Windows Developer Mode or run once as administrator.")
+
+
+def setup_game_layout(game, output):
+    """Share the dump as app0 and place its streamed data archive beside it, without extraction."""
+    game, output = pathlib.Path(game).resolve(), pathlib.Path(output).resolve()
+    app0 = output / "app0"
+    if output == game or game in output.parents or app0 == game or app0 in game.parents:
+        raise ValueError("The runtime layout must not overwrite or be created inside the source dump")
+    if not game.is_dir():
+        raise FileNotFoundError(f"missing game dump: {game}")
+    archive = game / "app0.zar"
+    has_archive = archive.is_file() and archive.stat().st_size > 0
+    if os.path.lexists(archive) and not has_archive:
+        raise ValueError(f"not a usable archive: {archive}")
+    data = game / "data"
+    if not has_archive and not data.is_dir():
+        raise ValueError(f"{game}: neither data nor app0.zar is available")
+    output.mkdir(parents=True, exist_ok=True)
+    link_directory(game, app0)
+    if has_archive:
+        link(archive, output / "app0.zar")
+    else:
+        # A plain dump must not accidentally mount a previous dump's streamed data.
+        remove_generated_path(output / "app0.zar")
 
 
 def build_shim(library, nids, out):
@@ -120,12 +211,13 @@ def make_non_rt(source, target, patches=NON_RT):
         target.write_bytes(bytes(data))
 
 
-def main():
+def main(game=GAME):
     if not (RUN / "AstroBot.exe").exists():
         sys.exit("Build\\Run\\AstroBot.exe is missing")
     for required in [KYTY_GPU / "kyty_gpu.dll", BUILT / "libAstroHybridHost.prx", NIDS] + [BUILT / name for name in FRESH]:
         if not required.exists():
             sys.exit(f"missing {required}")
+    setup_game_layout(game, HYBRID)
     libs = HYBRID / "libs"
     libs.mkdir(parents=True, exist_ok=True)
     for item in RUN.iterdir():
@@ -146,9 +238,6 @@ def main():
     rows = [re.match(r'KYTY_GPU_NID\(\d+, "([^"]+)", "([^"]+)"', line) for line in NIDS.read_text(encoding="utf-8").splitlines()]
     per_library = {name: [m.group(1) for m in rows if m and m.group(2) == name] for name in SHIMS}
     shims = {name: build_shim(name, nids, libs / name) for name, nids in per_library.items()}
-    app0 = HYBRID / "app0"
-    if not app0.exists():
-        subprocess.run(["cmd", "/c", "mklink", "/J", str(app0), str(GAME)], check=True, capture_output=True)
     if (RUN / "AstroBot-NonTiled.exe").exists():
         make_non_rt(RUN / "AstroBot-NonTiled.exe", HYBRID / "AstroBot-NonRT.exe")
         make_non_rt(RUN / "AstroBot-NonTiled.exe", HYBRID / "AstroBot-NonRT-SoftAssert.exe", NON_RT + SOFT_ASSERT)
@@ -172,4 +261,14 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--game", type=pathlib.Path, default=GAME, help="source game dump (never modified)")
+    parser.add_argument("--layout-only", action="store_true", help="only link app0 and its sibling archive")
+    parser.add_argument("--output", type=pathlib.Path, default=HYBRID, help="runtime directory for --layout-only")
+    args = parser.parse_args()
+    if args.layout_only:
+        setup_game_layout(args.game, args.output)
+    else:
+        if args.output != HYBRID:
+            parser.error("--output requires --layout-only")
+        main(args.game)

@@ -200,12 +200,38 @@ namespace AstroHybrid.App.Services
                     return false;
             }
 
-            // Check app0 junction
+            // app0 alone can be a broken/incomplete dump. Streamed data lives beside it, not inside it.
             var app0Path = Path.Combine(installPath, "app0");
             if (!Directory.Exists(app0Path))
                 return false;
 
-            return true;
+            return HasUsableDataBackend(installPath);
+        }
+
+        private static bool HasUsableDataBackend(string installPath)
+        {
+            var dataPath = Path.Combine(installPath, "app0", "data");
+            try
+            {
+                if (Directory.Exists(dataPath))
+                {
+                    // Do not let an empty placeholder hide a missing archive. Check accessibility without
+                    // walking/copying the dump; archive-only layouts do not need a data directory.
+                    using var entries = Directory.EnumerateFileSystemEntries(dataPath).GetEnumerator();
+                    if (entries.MoveNext()) return true;
+                }
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+
+            var archivePath = Path.Combine(installPath, "app0.zar");
+            try
+            {
+                using var archive = new FileStream(archivePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                return archive.Length > 0 && archive.ReadByte() != -1;
+            }
+            catch (IOException) { return false; }
+            catch (UnauthorizedAccessException) { return false; }
         }
 
         public async Task<bool> InstallAsync(string gameDumpPath, IProgress<SetupStep>? progress = null)
@@ -272,9 +298,8 @@ namespace AstroHybrid.App.Services
             throw new InvalidOperationException("To move the game, close the app, move the whole AstroHybrid folder, then use Repair once.");
         }
 
-        // Removes what the setup built from the dump (the game programs, app0 and the feature file); the runtime
-        // that came with the download stays, so the setup can run again. app0's links are removed as links,
-        // never followed into the dump.
+        // Removes what the setup built from the dump (the game programs, app0, its sibling archive and the
+        // feature file); the runtime stays so setup can run again. Links are removed, never followed into the dump.
         public async Task UninstallAsync(bool keepGameDump = true)
         {
             await Task.Run(() =>
@@ -282,6 +307,9 @@ namespace AstroHybrid.App.Services
                 var installPath = Path.Combine(_rootDirectory, "Build", "RunHybrid");
                 if (!Directory.Exists(installPath)) return;
                 GameSetup.DeleteTree(Path.Combine(installPath, "app0"));
+                // Delete only the generated sibling entry (hard link, symlink or copy), never the source path
+                // saved in settings. File.Delete also handles a dangling file symlink and a missing archive.
+                File.Delete(Path.Combine(installPath, "app0.zar"));
                 foreach (var file in Directory.GetFiles(installPath, "AstroBot*.exe").Concat(Directory.GetFiles(installPath, "AstroBot*.json")))
                 {
                     File.Delete(file);

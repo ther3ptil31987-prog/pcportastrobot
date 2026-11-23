@@ -1,12 +1,17 @@
 # Reproducible build of the Astro Bot Windows runtime from the project root.
 # Steps: toolchain -> AnyPS5 (pinned) -> configure/build -> unwrap SELFs -> relink -> runtime layout.
-# Usage: powershell -ExecutionPolicy Bypass -File Tools\build.ps1 [-SkipToolchain] [-SkipBuild]
-param([switch]$SkipToolchain, [switch]$SkipBuild)
+# Usage: powershell -ExecutionPolicy Bypass -File Tools\build.ps1 [-SkipToolchain] [-SkipBuild] [-GameDumpPath DUMP]
+param(
+    [switch]$SkipToolchain,
+    [switch]$SkipBuild,
+    [string]$GameDumpPath = $env:ASTROHYBRID_GAME_DUMP
+)
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 $Tools = "$Root\Tools"
-$Game = "$Root\Game\PPSA21567-app"
-$AnyPS5Commit = '319621ba2'        # tested revision of boykopovar/AnyPS5 main; Source/patches/*.patch go on top
+$Game = if ($GameDumpPath) { (Resolve-Path -LiteralPath $GameDumpPath).Path } else { "$Root\Game\PPSA21567-app" }
+$AnyPS5Commit = '319621ba2e578bd053b0baba2877fe70520e0737' # Source/anyps5/*.patch is the canonical series
+$AnyPS5Url = 'https://github.com/boykopovar/AnyPS5.git'
 $WinLibs = 'https://github.com/brechtsanders/winlibs_mingw/releases/download/15.2.0posix-14.0.0-ucrt-r7/winlibs-x86_64-posix-seh-gcc-15.2.0-mingw-w64ucrt-14.0.0-r7.zip'
 $SevenZip = 'C:\Program Files\7-Zip\7z.exe'
 
@@ -20,13 +25,16 @@ if (-not $SkipToolchain) {
         curl.exe -sSfL -o "$Tools\dl\winlibs.zip" $WinLibs; Check
         & $SevenZip x "$Tools\dl\winlibs.zip" "-o$Tools\winlibs" -y | Out-Null; Check
     }
+    $Patches = @(Get-ChildItem -LiteralPath "$Root\Source\anyps5" -Filter '*.patch' -File | Sort-Object Name)
+    if ($Patches.Count -eq 0) { throw 'The canonical Source\anyps5 patch series is missing.' }
     if (-not (Test-Path "$Tools\AnyPS5\.git")) {
         Step 'Cloning AnyPS5'
-        git clone https://github.com/boykopovar/AnyPS5.git "$Tools\AnyPS5"; Check
+        git clone --no-checkout --filter=blob:none $AnyPS5Url "$Tools\AnyPS5"; Check
     }
-    git -C "$Tools\AnyPS5" fetch --filter=blob:none --deepen 200 origin main; Check
+    # Fetch the exact revision, not a moving main branch or an arbitrary shallow-history window.
+    git -C "$Tools\AnyPS5" fetch --filter=blob:none $AnyPS5Url $AnyPS5Commit; Check
     git -C "$Tools\AnyPS5" checkout -B astrobot $AnyPS5Commit; Check
-    foreach ($patch in Get-ChildItem "$Root\Source\patches\*.patch" | Sort-Object Name) {
+    foreach ($patch in $Patches) {
         Step "Applying $($patch.Name)"
         git -C "$Tools\AnyPS5" -c user.name=local -c user.email=local@localhost am --3way $patch.FullName; Check
     }
@@ -57,8 +65,9 @@ foreach ($m in 'libc', 'libSceNpCppWebApi') {
 Step 'Relinking to a Windows PE'
 $Run = "$Root\Build\Run"
 New-Item -ItemType Directory -Force "$Run\libs" | Out-Null
-# app0 is a junction to the game folder so the 160 GB of assets are never copied.
-if (-not (Test-Path "$Run\app0")) { cmd /c mklink /J "$Run\app0" "$Game" | Out-Null }
+# Share the selected dump as app0; app0.zar is linked/copied beside it and stale archives are removed.
+# The same layout helper assembles RunHybrid; it never extracts or modifies the source dump.
+python -I "$Tools\hybrid\make_run_hybrid.py" --layout-only --game "$Game" --output "$Run"; Check
 & "$B\core\relinker\relinker.exe" --windows --registry "$In\eboot.elf" "$Run\AstroBot.exe"; Check
 
 Step 'Assembling runtime libraries'

@@ -29,6 +29,14 @@ Controllers: DualSense, DualShock 4, Xbox, Switch Pro and compatible pads, gener
 Command line: `AstroHybrid.exe --setup "<dump folder>"` runs the setup without a window; `--remove-game` removes
 what setup built.
 
+### ZArchive (`app0.zar`) dumps
+
+Setup accepts `app0.zar` alongside loose `eboot.bin`, `sce_module` and `sce_sys`; no empty `data` folder is needed.
+Archive entries must be relative to the dump root (`data/...`, **not** `app0/data/...`). The archive is installed
+beside `Build\RunHybrid\app0`. The additional runtime patches provide read-only archive stdio and exact-first
+`.odx` to `.odxb` filename fallback; an older release needs rebuilt runtime libraries, not just Repair.
+See [the ZAR layout, build and troubleshooting guide](Docs/ZAR.md). Full game verification on Windows is still required.
+
 ### Screenshots
 
 | Home | Graphics |
@@ -132,7 +140,7 @@ drives the screen:
 
 | Folder | Contents |
 |---|---|
-| `Source/patches` | AnyPS5 patch series (native libraries, AstroHybrid host, DualSense input/rumble/triggers/motion, CUDA address window) |
+| `Source/anyps5` | Canonical AnyPS5 patch series, including native libraries, AstroHybrid host, controller fixes, CUDA address window and ZAR compatibility (`Source/patches` is historical) |
 | `Source/hybrid/patches` | KytyPS5 patch series for `kyty_gpu.dll` (frame pacing, real-time speed, fast path, Reflex, DLSS, Frame Generation, overlay, controllers) |
 | `Source/game-patches` | Small optional byte patches applied at load time (lighting mode, GI probes, fixed 1080p) |
 | `Source/experiments` | Measured experiments that were not kept, with their patches |
