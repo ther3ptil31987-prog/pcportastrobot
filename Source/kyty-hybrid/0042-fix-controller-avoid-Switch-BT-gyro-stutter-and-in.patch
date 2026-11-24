@@ -1,0 +1,489 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Local Build <local@invalid>
+Date: Tue, 17 Nov 2026 21:10:00 +0000
+Subject: [PATCH] fix(controller): avoid Switch BT gyro stutter and LED/rumble
+ stalls (#112)
+
+---
+diff --git a/src/graphics/presentation/window/hostInput.cpp b/src/graphics/presentation/window/hostInput.cpp
+index 10ea3afc..ba8095ad 100644
+--- a/src/graphics/presentation/window/hostInput.cpp
++++ b/src/graphics/presentation/window/hostInput.cpp
+@@ -1037,6 +1037,28 @@ void HostInputToggleMouseToJoystick() {
+ 	LOGF("Mouse to right stick: enabled (F7 to release)\n");
+ }
+ 
++static void FinishHostEvent(SDL_Event* event, bool has_event) {
++	if (Config::HideCursorEnabled() && !TouchPadModeActive()) {
++		const auto now_ms = SDL_GetTicks();
++		if (has_event && !g_mouse.enabled && IsCursorActivity(*event) &&
++		    SDL_GetWindowFromEvent(event) == g_mouse_window) {
++			SDL_ShowCursor();
++			g_cursor_hide_at = now_ms + CURSOR_IDLE_HIDE_MS;
++		} else if (g_cursor_hide_at != 0 && now_ms >= g_cursor_hide_at) {
++			SDL_HideCursor();
++			g_cursor_hide_at = 0;
++		}
++	}
++
++	if (has_event && event->type == SDL_EVENT_WINDOW_FOCUS_LOST &&
++	    event->window.windowID == SDL_GetWindowID(g_mouse_window)) {
++		Common::HostInputTrace("focus-lost", 0, 0);
++		g_input_pulse.ReleaseAll(ApplyHostKey);
++		g_mouse.next_poll = 0;
++		CenterMouseStick();
++	}
++}
++
+ bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms) {
+ 	// -1 waits without a deadline (until max_wait_ms below).
+ 	int timeout = g_input_pulse.Poll(SDL_GetTicks(), ApplyHostKey);
+@@ -1067,26 +1089,18 @@ bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms) {
+ 		EXIT("%s\n", SDL_GetError());
+ 	}
+ 
+-	if (Config::HideCursorEnabled() && !TouchPadModeActive()) {
+-		const auto now_ms = SDL_GetTicks();
+-		if (has_event && !g_mouse.enabled && IsCursorActivity(*event) &&
+-		    SDL_GetWindowFromEvent(event) == g_mouse_window) {
+-			SDL_ShowCursor();
+-			g_cursor_hide_at = now_ms + CURSOR_IDLE_HIDE_MS;
+-		} else if (g_cursor_hide_at != 0 && now_ms >= g_cursor_hide_at) {
+-			SDL_HideCursor();
+-			g_cursor_hide_at = 0;
+-		}
+-	}
++	FinishHostEvent(event, has_event);
++	return has_event;
++}
+ 
+-	if (has_event && event->type == SDL_EVENT_WINDOW_FOCUS_LOST &&
+-	    event->window.windowID == SDL_GetWindowID(g_mouse_window)) {
+-		Common::HostInputTrace("focus-lost", 0, 0);
+-		g_input_pulse.ReleaseAll(ApplyHostKey);
+-		g_mouse.next_poll = 0;
+-		CenterMouseStick();
++bool HostInputDrainEvent(SDL_Event* event) {
++	// Pop already-pumped events without invoking SDL_WaitEventTimeout(..., 0), which would re-pump
++	// Windows/HID devices for every high-rate gyro/accel sample during Switch Pro or PS5 bursts.
++	if (SDL_PeepEvents(event, 1, SDL_GETEVENT, SDL_EVENT_FIRST, SDL_EVENT_LAST) <= 0) {
++		return false;
+ 	}
+-	return has_event;
++	FinishHostEvent(event, true);
++	return true;
+ }
+ 
+ } // namespace Libs::Graphics
+diff --git a/src/graphics/presentation/window/hostInput.h b/src/graphics/presentation/window/hostInput.h
+index 53e94640..eae937e4 100644
+--- a/src/graphics/presentation/window/hostInput.h
++++ b/src/graphics/presentation/window/hostInput.h
+@@ -37,6 +37,7 @@ void               HostInputDisconnectGamepadTouchPad(int id);
+ [[nodiscard]] HostInputTouchPadVisualState GetHostInputTouchPadVisualState();
+ void               HostInputToggleMouseToJoystick();
+ [[nodiscard]] bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms);
++[[nodiscard]] bool HostInputDrainEvent(SDL_Event* event);
+ 
+ } // namespace Libs::Graphics
+ 
+diff --git a/src/graphics/presentation/window/window.cpp b/src/graphics/presentation/window/window.cpp
+index ae017617..20a35ec1 100644
+--- a/src/graphics/presentation/window/window.cpp
++++ b/src/graphics/presentation/window/window.cpp
+@@ -833,6 +833,9 @@ void WindowContext::Run() {
+ 			continue;
+ 		}
+ 		ProcessEvent(timer.GetTimeS());
++		for (int drained = 0; drained < 1024 && !loop.need_exit && HostInputDrainEvent(&loop.event); ++drained) {
++			ProcessEvent(timer.GetTimeS());
++		}
+ 	}
+ }
+ 
+diff --git a/src/libs/controller.cpp b/src/libs/controller.cpp
+index ad393f7e..84f1ad62 100644
+--- a/src/libs/controller.cpp
++++ b/src/libs/controller.cpp
+@@ -154,13 +154,22 @@ private:
+ 	void AddState();
+ 	// Emulated tilt: the right stick drives pitch and roll instead of the stick axes.
+ 	void UpdateEmulatedTilt();
+-	// Apply cached output without changing its game-requested lifetime; caller holds m_mutex.
+-	void ApplyVibration();
+-	bool SendTriggerEffect(const PadTriggerEffectParam& param);
++	struct VibrationRequest {
++		int      active_id   = -1;
++		uint8_t  large_motor = 0;
++		uint8_t  small_motor = 0;
++		uint32_t duration    = 0;
++	};
++	// Snapshot vibration parameters while holding m_mutex; send HID outside m_mutex.
++	VibrationRequest PrepareVibration();
++	void             SendVibration(const VibrationRequest& req) const;
++	static bool      BuildTriggerEffect(const PadTriggerEffectParam& param, float scale,
++	                                    DualSenseEffects& effect);
++	static void      DispatchTriggerEffect(int active_id, const DualSenseEffects& effect);
+ 
+ 	Common::Mutex    m_mutex;
+ 	PortState        m_port_state      = PortState::Uninitialized;
+-	int              m_active_id       = -1;
++	std::atomic<int> m_active_id       {-1};
+ 	bool             m_connected       = false;
+ 	int              m_connected_count = 0;
+ 	bool             m_motion_enabled  = true;
+@@ -286,14 +295,29 @@ float GetSettingScale(Setting setting) {
+ }
+ 
+ void GameController::CycleSetting(Setting setting) {
+-	Common::LockGuard lock(m_mutex);
+-	auto&             step = m_setting_steps[static_cast<size_t>(setting)];
+-	const auto count = setting == Setting::SpeakerVolume ? SPEAKER_VOLUME.size() : INTENSITY.size();
+-	step.store((step.load(std::memory_order_relaxed) + 1) % count, std::memory_order_relaxed);
+-	if (setting == Setting::VibrationIntensity) {
+-		ApplyVibration();
+-	} else if (setting == Setting::TriggerEffectIntensity) {
+-		(void)SendTriggerEffect(m_trigger_effect);
++	VibrationRequest vib {};
++	DualSenseEffects effect {};
++	int              active_id = -1;
++	bool             send_vib  = false;
++	bool             send_trig = false;
++	{
++		Common::LockGuard lock(m_mutex);
++		auto&             step  = m_setting_steps[static_cast<size_t>(setting)];
++		const auto        count = setting == Setting::SpeakerVolume ? SPEAKER_VOLUME.size() : INTENSITY.size();
++		step.store((step.load(std::memory_order_relaxed) + 1) % count, std::memory_order_relaxed);
++		if (setting == Setting::VibrationIntensity) {
++			vib      = PrepareVibration();
++			send_vib = true;
++		} else if (setting == Setting::TriggerEffectIntensity) {
++			active_id = m_active_id;
++			send_trig = BuildTriggerEffect(m_trigger_effect,
++			                               GetSettingScale(Setting::TriggerEffectIntensity), effect);
++		}
++	}
++	if (send_vib) {
++		SendVibration(vib);
++	} else if (send_trig) {
++		DispatchTriggerEffect(active_id, effect);
+ 	}
+ }
+ 
+@@ -516,6 +540,17 @@ static bool HostInputOnly() {
+ 	return enabled;
+ }
+ 
++static bool SupportsRgbLed(SDL_Gamepad* pad) {
++	return pad != nullptr &&
++	       SDL_GetBooleanProperty(SDL_GetGamepadProperties(pad), SDL_PROP_GAMEPAD_CAP_RGB_LED_BOOLEAN, false);
++}
++
++static bool IsSwitchGamepad(int id) {
++	const auto type = SDL_GetGamepadTypeForID(static_cast<SDL_JoystickID>(id));
++	return type >= SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO &&
++	       type <= SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR;
++}
++
+ void GameController::SetDevices(int active_id) {
+ 	Common::LockGuard lock(m_mutex);
+ 	if (m_active_id == active_id) {
+@@ -524,13 +559,16 @@ void GameController::SetDevices(int active_id) {
+ 	if (active_id != HOST_INPUT_CONTROLLER_ID && active_id != -1) {
+ 		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(active_id));
+ 		    pad != nullptr) {
+-			if (const auto& color = Config::GetControllerColor()) {
++			if (const auto& color = Config::GetControllerColor(); color && SupportsRgbLed(pad)) {
+ 				(void)SDL_SetGamepadLED(pad, (*color)[0], (*color)[1], (*color)[2]);
+ 			}
+-			for (auto sensor: {SDL_SENSOR_ACCEL, SDL_SENSOR_GYRO}) {
+-				if (SDL_GamepadHasSensor(pad, sensor) &&
+-				    !SDL_SetGamepadSensorEnabled(pad, sensor, true)) {
+-					LOGF("\t enabling controller sensor failed: %s\n", SDL_GetError());
++			const char* motion_env = std::getenv("ASTROHYBRID_PAD_MOTION");
++			if (motion_env == nullptr || std::strcmp(motion_env, "0") != 0) {
++				for (auto sensor: {SDL_SENSOR_ACCEL, SDL_SENSOR_GYRO}) {
++					if (SDL_GamepadHasSensor(pad, sensor) &&
++					    !SDL_SetGamepadSensorEnabled(pad, sensor, true)) {
++						LOGF("\t enabling controller sensor failed: %s\n", SDL_GetError());
++					}
+ 				}
+ 			}
+ 		}
+@@ -781,6 +819,15 @@ void GameController::Motion(int id, Sensor sensor, const float* data, uint64_t t
+ 		m_gyro_time = time_us;
+ 	}
+ 	m_state.time = LibKernel::KernelGetProcessTime();
++	// Pure sensor updates do not change buttons/touch: coalesce into the latest unread ring entry
++	// so high-rate 200Hz Switch/PS5 gyro bursts never overflow the 64-entry state buffer.
++	if (m_states_num != 0) {
++		const auto newest = (m_first_state + m_states_num - 1) % STATES_MAX;
++		if (!m_obtained[newest]) {
++			m_states[newest] = m_state;
++			return;
++		}
++	}
+ 	AddState();
+ }
+ 
+@@ -906,7 +953,9 @@ static void StopHostPad(SDL_Gamepad* pad) {
+ 		(void)SDL_SendGamepadEffect(pad, &effect, sizeof(effect));
+ 	}
+ 	(void)SDL_RumbleGamepad(pad, 0, 0, 0);
+-	(void)SDL_SetGamepadLED(pad, 0, 0, 0);
++	if (SupportsRgbLed(pad)) {
++		(void)SDL_SetGamepadLED(pad, 0, 0, 0);
++	}
+ }
+ 
+ // ASTROHYBRID_RUMBLE_SCALE=percent (default 100, 0..200): rumble strength for pads other than a
+@@ -933,92 +982,130 @@ static uint16_t HostRumble(int id, uint8_t motor) {
+ }
+ 
+ void GameController::SetVibration(uint8_t large_motor, uint8_t small_motor) {
+-	Common::LockGuard lock(m_mutex);
+-	m_vibration       = {large_motor, small_motor};
+-	m_vibration_until = SDL_GetTicks() + RUMBLE_DURATION_MS;
+-	ApplyVibration();
++	VibrationRequest req {};
++	{
++		Common::LockGuard lock(m_mutex);
++		m_vibration       = {large_motor, small_motor};
++		m_vibration_until = SDL_GetTicks() + RUMBLE_DURATION_MS;
++		req               = PrepareVibration();
++	}
++	SendVibration(req);
+ }
+ 
+-void GameController::ApplyVibration() {
++GameController::VibrationRequest GameController::PrepareVibration() {
+ 	const auto now = SDL_GetTicks();
+ 	const auto duration =
+ 	    m_vibration_until > now ? static_cast<uint32_t>(m_vibration_until - now) : 0;
+-	const auto scale       = duration != 0 ? GetSettingScale(Setting::VibrationIntensity) : 0.0f;
+-	const auto large_motor = Scale(m_vibration[0], scale);
+-	const auto small_motor = Scale(m_vibration[1], scale);
++	const auto scale = duration != 0 ? GetSettingScale(Setting::VibrationIntensity) : 0.0f;
++	return {m_active_id, Scale(m_vibration[0], scale), Scale(m_vibration[1], scale), duration};
++}
++
++void GameController::SendVibration(const VibrationRequest& req) const {
+ 	// The DualSense haptics backend drives a single pad, so only player 1 uses it.
+ 	if (m_player == 0 &&
+-	    DualSenseHaptics::SetVibration(m_active_id, large_motor, small_motor, duration)) {
++	    DualSenseHaptics::SetVibration(req.active_id, req.large_motor, req.small_motor, req.duration)) {
+ 		return;
+ 	}
+ 
+-	if (m_active_id == HOST_INPUT_CONTROLLER_ID) {
++	if (req.active_id == HOST_INPUT_CONTROLLER_ID || req.active_id == -1) {
+ 		return;
+ 	}
+ 
+-	auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(m_active_id));
+-	if (pad == nullptr) {
+-		return;
++	// Switch Pro BT HID output writes hold rumble_pending (pausing reads) and share dev_lock with
++	// input polling: rate-limit non-zero Switch rumble updates while keeping stop (0,0) immediate.
++	const bool is_switch = IsSwitchGamepad(req.active_id);
++	if (is_switch && (req.large_motor != 0 || req.small_motor != 0)) {
++		static std::atomic<uint64_t> last_switch_rumble_ms {0};
++		const uint64_t               now  = SDL_GetTicks();
++		uint64_t                     prev = last_switch_rumble_ms.load(std::memory_order_relaxed);
++		if ((prev != 0 && now - prev < 45) || !last_switch_rumble_ms.compare_exchange_strong(prev, now)) {
++			return;
++		}
+ 	}
+ 
+-	const auto large = HostRumble(m_active_id, large_motor);
+-	const auto small = HostRumble(m_active_id, small_motor);
+-	if (!SDL_RumbleGamepad(pad, large, small, duration)) {
+-		LOGF("\t rumble failed: %s\n", SDL_GetError());
++	SDL_LockJoysticks();
++	if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(req.active_id)); pad != nullptr) {
++		const auto large = HostRumble(req.active_id, req.large_motor);
++		const auto small = HostRumble(req.active_id, req.small_motor);
++		if (!SDL_RumbleGamepad(pad, large, small, req.duration)) {
++			LOGF("\t rumble failed: %s\n", SDL_GetError());
++		}
+ 	}
++	SDL_UnlockJoysticks();
+ }
+ 
+ int GameController::GetActiveControllerId() {
+-	Common::LockGuard lock(m_mutex);
+-	return m_active_id;
++	return m_active_id.load(std::memory_order_acquire);
+ }
+ 
+ void GameController::SetLightBar(uint8_t r, uint8_t g, uint8_t b) {
+-	Common::LockGuard lock(m_mutex);
+-	if (const auto& color = Config::GetControllerColor()) {
+-		r = (*color)[0];
+-		g = (*color)[1];
+-		b = (*color)[2];
++	int active_id = -1;
++	{
++		Common::LockGuard lock(m_mutex);
++		if (const auto& color = Config::GetControllerColor()) {
++			r = (*color)[0];
++			g = (*color)[1];
++			b = (*color)[2];
++		}
++		active_id = m_active_id;
+ 	}
+-	if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(m_active_id));
+-	    pad != nullptr) {
++	if (active_id == HOST_INPUT_CONTROLLER_ID || active_id == -1) {
++		return;
++	}
++	// Skip non-RGB LED controllers (e.g. Switch Pro Home LED, whose SetHomeLight subcommand blocks
++	// up to 500ms waiting for an ACK inside SDL_LockJoysticks() on third-party BT pads).
++	if (IsSwitchGamepad(active_id)) {
++		return;
++	}
++	SDL_LockJoysticks();
++	if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(active_id));
++	    SupportsRgbLed(pad)) {
+ 		(void)SDL_SetGamepadLED(pad, r, g, b);
+ 	}
++	SDL_UnlockJoysticks();
+ }
+ 
+ bool GameController::SetTriggerEffect(const PadTriggerEffectParam& param) {
+-	Common::LockGuard lock(m_mutex);
+-	// The state the game reads back follows every effect it sets, also one the DualSense output
+-	// cannot reproduce (values outside the ranges trigger_effect_to_dualsense converts).
+-	if ((param.trigger_mask & ~0x03u) == 0) {
+-		for (int i = 0; i < 2; i++) {
+-			if ((param.trigger_mask & (1u << i)) != 0) {
+-				m_state_effect.trigger_mask |= static_cast<uint8_t>(1u << i);
+-				m_state_effect.command[i] = param.command[i];
+-			}
+-		}
+-	}
+-	if (!SendTriggerEffect(param)) {
+-		static std::atomic<int> logged {0};
+-		if (logged.fetch_add(1) < 16) {
++	int              active_id = -1;
++	DualSenseEffects effect {};
++	{
++		Common::LockGuard lock(m_mutex);
++		// The state the game reads back follows every effect it sets, also one the DualSense output
++		// cannot reproduce (values outside the ranges trigger_effect_to_dualsense converts).
++		if ((param.trigger_mask & ~0x03u) == 0) {
+ 			for (int i = 0; i < 2; i++) {
+ 				if ((param.trigger_mask & (1u << i)) != 0) {
+-					const auto& c = param.command[i];
+-					std::fprintf(stderr,
+-					             "Pad: trigger effect not sent to the controller: mask=0x%x trigger=%d mode=%u "
+-					             "data=%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u\n",
+-					             param.trigger_mask, i, c.mode, c.data[0], c.data[1], c.data[2], c.data[3],
+-					             c.data[4], c.data[5], c.data[6], c.data[7], c.data[8], c.data[9], c.data[10]);
++					m_state_effect.trigger_mask |= static_cast<uint8_t>(1u << i);
++					m_state_effect.command[i] = param.command[i];
+ 				}
+ 			}
+ 		}
+-		return false;
+-	}
+-	for (int i = 0; i < 2; i++) {
+-		if ((param.trigger_mask & (1u << i)) != 0) {
+-			m_trigger_effect.trigger_mask |= static_cast<uint8_t>(1u << i);
+-			m_trigger_effect.command[i] = param.command[i];
++		if (!BuildTriggerEffect(param, GetSettingScale(Setting::TriggerEffectIntensity), effect)) {
++			static std::atomic<int> logged {0};
++			if (logged.fetch_add(1) < 16) {
++				for (int i = 0; i < 2; i++) {
++					if ((param.trigger_mask & (1u << i)) != 0) {
++						const auto& c = param.command[i];
++						std::fprintf(stderr,
++						             "Pad: trigger effect not sent to the controller: mask=0x%x trigger=%d mode=%u "
++						             "data=%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u\n",
++						             param.trigger_mask, i, c.mode, c.data[0], c.data[1], c.data[2], c.data[3],
++						             c.data[4], c.data[5], c.data[6], c.data[7], c.data[8], c.data[9], c.data[10]);
++					}
++				}
++			}
++			return false;
+ 		}
++		for (int i = 0; i < 2; i++) {
++			if ((param.trigger_mask & (1u << i)) != 0) {
++				m_trigger_effect.trigger_mask |= static_cast<uint8_t>(1u << i);
++				m_trigger_effect.command[i] = param.command[i];
++			}
++		}
++		active_id = m_active_id;
++	}
++	if (effect.enable_bits != 0) {
++		DispatchTriggerEffect(active_id, effect);
+ 	}
+ 	return true;
+ }
+@@ -1044,13 +1131,13 @@ void GameController::GetTriggerEffectState(int32_t* state) {
+ 	}
+ }
+ 
+-bool GameController::SendTriggerEffect(const PadTriggerEffectParam& param) {
++bool GameController::BuildTriggerEffect(const PadTriggerEffectParam& param, float scale,
++                                        DualSenseEffects& effect) {
+ 	if ((param.trigger_mask & ~0x03u) != 0) {
+ 		return false;
+ 	}
+ 
+-	DualSenseEffects effect {};
+-	const auto       scale = GetSettingScale(Setting::TriggerEffectIntensity);
++	effect = {};
+ 	if ((param.trigger_mask & 0x01u) != 0) {
+ 		effect.enable_bits |= 0x08;
+ 		if (!trigger_effect_to_dualsense(param.command[0], effect.left_trigger, scale)) {
+@@ -1063,15 +1150,19 @@ bool GameController::SendTriggerEffect(const PadTriggerEffectParam& param) {
+ 			return false;
+ 		}
+ 	}
+-	if (effect.enable_bits == 0) {
+-		return true;
+-	}
++	return true;
++}
+ 
+-	auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(m_active_id));
+-	if (pad != nullptr && SDL_GetGamepadType(pad) == SDL_GAMEPAD_TYPE_PS5) {
++void GameController::DispatchTriggerEffect(int active_id, const DualSenseEffects& effect) {
++	if (effect.enable_bits == 0 || active_id == HOST_INPUT_CONTROLLER_ID || active_id == -1) {
++		return;
++	}
++	SDL_LockJoysticks();
++	if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(active_id));
++	    pad != nullptr && SDL_GetGamepadType(pad) == SDL_GAMEPAD_TYPE_PS5) {
+ 		(void)SDL_SendGamepadEffect(pad, &effect, sizeof(effect));
+ 	}
+-	return true;
++	SDL_UnlockJoysticks();
+ }
+ 
+ void GameController::GetConnectionInfo(bool* flag, int* count) {
+@@ -1681,7 +1772,6 @@ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
+ 
+ int KYTY_SYSV_ABI PadSetVibration(int handle, const PadVibrationParam* param) {
+ 	PRINT_NAME();
+-	Common::LockGuard lock(g_router_mutex);
+ 
+ 	if (const auto error = PadCheckHandle(handle); error != OK) {
+ 		return error;
+@@ -1711,7 +1801,6 @@ int KYTY_SYSV_ABI PadResetLightBar(int handle) {
+ 
+ int KYTY_SYSV_ABI PadSetLightBar(int handle, const PadLightBarParam* param) {
+ 	PRINT_NAME();
+-	Common::LockGuard lock(g_router_mutex);
+ 
+ 	if (const auto error = PadCheckHandle(handle); error != OK) {
+ 		return error;
+@@ -1727,7 +1816,6 @@ int KYTY_SYSV_ABI PadSetLightBar(int handle, const PadLightBarParam* param) {
+ 
+ int KYTY_SYSV_ABI PadSetTriggerEffect(int handle, const PadTriggerEffectParam* param) {
+ 	PRINT_NAME();
+-	Common::LockGuard lock(g_router_mutex);
+ 
+ 	if (const auto error = PadCheckHandle(handle); error != OK) {
+ 		return error;

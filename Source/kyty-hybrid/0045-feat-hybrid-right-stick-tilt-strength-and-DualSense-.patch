@@ -1,0 +1,60 @@
+From e2c9d2c149c6d311819ece8f596ea462326a1a75 Mon Sep 17 00:00:00 2001
+From: Codex <local@invalid>
+Date: Thu, 19 Nov 2026 21:41:50 +0000
+Subject: [PATCH] feat(hybrid): right-stick tilt strength and DualSense speaker
+ mute
+
+ASTROHYBRID_TILT_STRENGTH (percent, 25-200, default 100) scales the emulated tilt's 45 degrees at
+full stick deflection, for game moments that need small, steady movements (pcportastrobot #146).
+ASTROHYBRID_DS_SPEAKER=0 keeps the controller speaker silent, wired or Bluetooth: the pad speaker
+audio counts as played without reaching the pad, so it is not moved to the main output (#143).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/hybrid/kytyGpuBridge.cpp | 10 ++++++++++
+ src/libs/controller.cpp      |  8 +++++++-
+ 2 files changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/src/hybrid/kytyGpuBridge.cpp b/src/hybrid/kytyGpuBridge.cpp
+index b8628fcd..37408439 100644
+--- a/src/hybrid/kytyGpuBridge.cpp
++++ b/src/hybrid/kytyGpuBridge.cpp
+@@ -931,6 +931,16 @@ extern "C" KYTY_GPU_EXPORT uint64_t KytyGpuQueuePadAudio(uint32_t freq, int is_s
+ 	if (data == nullptr || frames == 0 || channels == 0 || freq == 0) {
+ 		return 0;
+ 	}
++	// ASTROHYBRID_DS_SPEAKER=0 (pcportastrobot #143): the controller speaker stays silent, wired or
++	// Bluetooth. The audio counts as played (its duration), so the game's audio keeps its pace and the
++	// sound is not moved to the main output instead.
++	static const bool speaker_muted = [] {
++		const char* value = std::getenv("ASTROHYBRID_DS_SPEAKER");
++		return value != nullptr && value[0] == '0';
++	}();
++	if (is_speaker != 0 && speaker_muted) {
++		return std::max<uint64_t>(1, static_cast<uint64_t>(frames) * 1000000u / freq);
++	}
+ 	std::lock_guard lock(g_pad_audio_mutex);
+ 	const int controller = ResolvePadAudioController(is_speaker != 0);
+ 	if (controller <= 0) {
+diff --git a/src/libs/controller.cpp b/src/libs/controller.cpp
+index e99e2902..ee068423 100644
+--- a/src/libs/controller.cpp
++++ b/src/libs/controller.cpp
+@@ -855,7 +855,13 @@ static Quat QuatMultiply(const Quat& a, const Quat& b) {
+ }
+ 
+ void GameController::UpdateEmulatedTilt() {
+-	constexpr float max_angle = 0.7853982f; // 45 degrees at full stick deflection
++	// 45 degrees at full stick deflection, scaled by ASTROHYBRID_TILT_STRENGTH (percent, 25-200,
++	// default 100): where the game wants small, steady movements (pcportastrobot #146).
++	static const float max_angle = [] {
++		const char* value   = std::getenv("ASTROHYBRID_TILT_STRENGTH");
++		const long  percent = value != nullptr ? std::strtol(value, nullptr, 10) : 100;
++		return 0.7853982f * static_cast<float>(std::clamp(percent > 0 ? percent : 100L, 25L, 200L)) / 100.0f;
++	}();
+ 	const auto      angle     = [](int value) {
+         return std::clamp((value - 128) / 127.0f, -1.0f, 1.0f) * max_angle;
+ 	};
+-- 
+2.55.0.windows.5
+

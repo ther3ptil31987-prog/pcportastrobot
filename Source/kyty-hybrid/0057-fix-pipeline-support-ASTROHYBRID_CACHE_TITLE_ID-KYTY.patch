@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AstroHybrid <noreply@localhost>
+Date: Sun, 22 Nov 2026 20:39:06 +0000
+Subject: [PATCH] fix(pipeline): support ASTROHYBRID_CACHE_TITLE_ID,
+ KYTY_PIPELINE_LIST_CROSS, and app0/eboot.bin for shader prep
+
+---
+ .../host_gpu/renderer/pipeline/pipelineCache.cpp     | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+index e1cf54f2..fd463631 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+@@ -5571,7 +5571,7 @@ void PipelineCache::InitializePipelineList() {
+ 	const bool  prepare = EnvU64("KYTY_PIPELINE_LIST_PREPARE", 0) != 0;
+ 	const bool  off     = setting == nullptr || *setting == '\0' || std::strcmp(setting, "0") == 0;
+ 	if (off && !prepare) return;
+-	const auto title_id = PipelineCacheTitleId();
++	const auto title_id = PipelineCacheFileTitleId();
+ 	if (title_id.empty()) return;
+ 	const auto begin = CompileClockNs();
+ 	const auto path  = off || std::strcmp(setting, "1") == 0
+@@ -5601,12 +5601,16 @@ void PipelineCache::InitializePipelineList() {
+ 	bytes = {};
+ 	std::string version;
+ 	(void)Loader::SystemContentParamSfoGetString("APP_VER", &version);
+-	if (file.info.title_id != title_id || file.info.app_version != version) {
++	const bool cross = EnvU64("KYTY_PIPELINE_LIST_CROSS", 0) != 0;
++	if (file.info.title_id != title_id || (!cross && file.info.app_version != version)) {
+ 		PipelineCacheLog("Pipeline list: {} is for {} version {}, the game is {} version {}: ignored",
+ 		                 Common::PathToString(path), file.info.title_id, file.info.app_version, title_id, version);
+ 		return;
+ 	}
+-	const auto executable = PipelineListExecutable();
++	auto executable = PipelineListExecutable();
++	if (executable.empty()) {
++		executable = std::filesystem::path("app0") / "eboot.bin";
++	}
+ 	std::ifstream code_file(executable, std::ios::binary);
+ 	if (executable.empty() || !code_file) {
+ 		PipelineCacheLog("Pipeline list: the game executable ({}) cannot be read: ignored",
+@@ -5831,7 +5835,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
+ 		                 threads, m_skip_wait_ns / 1000);
+ 	}
+ 	if (EnvU64("KYTY_PIPELINE_STATS", 0) != 0) m_stats_reporter = std::make_unique<StatsReporter>(*this);
+-	if (EnvU64("KYTY_PIPELINE_LIST_PREPARE", 0) != 0 && !PipelineCacheTitleId().empty()) RunListPrepare();
++	if (EnvU64("KYTY_PIPELINE_LIST_PREPARE", 0) != 0 && !PipelineCacheFileTitleId().empty()) RunListPrepare();
+ }
+ 
+ PipelineCache::~PipelineCache() {
+-- 
+2.55.0.windows.5
+

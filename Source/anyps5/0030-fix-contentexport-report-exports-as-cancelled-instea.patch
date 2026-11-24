@@ -1,0 +1,155 @@
+From f987063d99b31dd6f608ad569a5d50c87f2e71fc Mon Sep 17 00:00:00 2001
+From: Local Build <local@invalid>
+Date: Wed, 18 Nov 2026 14:24:38 +0000
+Subject: fix(contentexport): report exports as cancelled instead of aborting
+
+sceContentExportFromData and the other export entry points were
+NotImplemented stubs, so a game that saves to the media gallery (Astro Bot,
+after about an hour of play: pcportastrobot #73) ended with SIGABRT
+"sceContentExportFromData not implemented".
+
+The FromData/FromFile family now checks the session as before, logs once,
+clears the output path and returns SCE_CONTENT_EXPORT_ERROR_CANCELED
+(0x809D3001), so the game's own failure path runs. The test covers the new
+return value and the cleared path.
+---
+ core/libs/prx/libSceContentExport/Export.cpp | 40 ++++++++++++--------
+ core/libs/tests/GuestContentExport.cpp       | 17 +++++++--
+ 2 files changed, 38 insertions(+), 19 deletions(-)
+
+diff --git a/core/libs/prx/libSceContentExport/Export.cpp b/core/libs/prx/libSceContentExport/Export.cpp
+index 5ec29d9900..2a44fc619c 100644
+--- a/core/libs/prx/libSceContentExport/Export.cpp
++++ b/core/libs/prx/libSceContentExport/Export.cpp
+@@ -4,6 +4,7 @@
+ #include "SceTypes.hpp"
+ #include "prx/libc/include/General.hpp"
+ #include <atomic>
++#include <cstdio>
+ #include <mutex>
+ #include <set>
+ #include <stdexcept>
+@@ -15,6 +16,7 @@ constexpr int ErrorInvalidState = static_cast<int>(0x809D3002u);
+ constexpr int ErrorBusy = static_cast<int>(0x809D3003u);
+ constexpr int ErrorNotInitialized = static_cast<int>(0x809D3004u);
+ constexpr int ErrorExecutionMax = static_cast<int>(0x809D3018u);
++constexpr int ErrorCanceled = static_cast<int>(0x809D3001u);
+ std::atomic<bool> g_initialized{false};
+ std::mutex g_sessionMutex;
+ std::set<std::int32_t> g_sessions;
+@@ -23,6 +25,21 @@ void RequireSession(const char* function, std::int32_t expId) {
+     if (!g_initialized.load()) throw std::logic_error(std::string(function) + ": not initialized");
+     if (!g_sessions.contains(expId)) throw std::invalid_argument(std::string(function) + ": unknown export session");
+ }
++
++// Saving to the console's media gallery (screenshots, videos) has no PC equivalent yet. The export
++// ends as if the player cancelled it, so the game's own error path runs instead of the process
++// aborting: Astro Bot called sceContentExportFromData after about an hour of play and stopped with
++// "sceContentExportFromData not implemented" (pcportastrobot #73).
++int ExportCanceled(const char* function, std::int32_t expId, char* path, std::size_t pathBufferLength) {
++    std::lock_guard lock(g_sessionMutex);
++    RequireSession(function, expId);
++    if (path != nullptr && pathBufferLength != 0) path[0] = '\0';
++    static std::atomic<bool> reported{false};
++    if (!reported.exchange(true)) {
++        std::fprintf(stderr, "[ContentExport] %s: exporting to the media gallery is not supported, reported as cancelled\n", function);
++    }
++    return ErrorCanceled;
++}
+ }
+ 
+ extern "C" {
+@@ -44,18 +61,15 @@ int APS5_VABI sceContentExportFinish(std::int32_t expId) {
+ }
+ 
+ int APS5_VABI sceContentExportFromData(std::int32_t expId, const ContentExportParam* param, std::size_t contentLength, ContentExportDataCallback callback, void* userData, char* path, std::size_t pathBufferLength) {
+- NotImplemented_nid_no_patch(__func__);
+- return 0;
++    return ExportCanceled(__func__, expId, path, pathBufferLength);
+ }
+ 
+ int APS5_VABI sceContentExportFromFile(std::int32_t expId, const ContentExportParam* param, const char* sourcePath, char* path, std::size_t pathBufferLength) {
+- NotImplemented_nid_no_patch(__func__);
+- return 0;
++    return ExportCanceled(__func__, expId, path, pathBufferLength);
+ }
+ 
+ int APS5_VABI sceContentExportFromFileWithThumbnail(std::int32_t expId, const ContentExportParam* param, const char* sourcePath, const char* thumbnailPath, char* path, std::size_t pathBufferLength) {
+- NotImplemented_nid_no_patch(__func__);
+- return 0;
++    return ExportCanceled(__func__, expId, path, pathBufferLength);
+ }
+ 
+ int APS5_VABI sceContentExportAddToFavorites(std::int64_t contentId) {
+@@ -79,18 +93,15 @@ int APS5_VABI sceContentExportFrom(void) {
+ }
+ 
+ int APS5_VABI sceContentExportFromFileForSf(std::int32_t expId, const ContentExportParam* param, const ContentExportSfParam* sfParam, const char* sourcePath, const char* thumbnailPath, char* path, std::size_t pathBufferLength) {
+- NotImplemented_nid_no_patch(__func__);
+- return 0;
++    return ExportCanceled(__func__, expId, path, pathBufferLength);
+ }
+ 
+ int APS5_VABI sceContentExportFromFileWithContentIdList(std::int32_t expId, const ContentExportParam* param, const char* sourcePath, const char* thumbnailPath, const std::int64_t* contentIds, std::uint32_t contentCount, char* path, std::size_t pathBufferLength) {
+- NotImplemented_nid_no_patch(__func__);
+- return 0;
++    return ExportCanceled(__func__, expId, path, pathBufferLength);
+ }
+ 
+ int APS5_VABI sceContentExportFromFileWithTitleIdList(std::int32_t expId, const ContentExportParam* param, const char* sourcePath, const char* thumbnailPath, const char* titleIdList, char* path, std::size_t pathBufferLength) {
+- NotImplemented_nid_no_patch(__func__);
+- return 0;
++    return ExportCanceled(__func__, expId, path, pathBufferLength);
+ }
+ 
+ int APS5_VABI sceContentExportInit(const ContentExportInitParam* param) {
+@@ -141,10 +152,7 @@ int APS5_VABI sceContentExportCancel(std::int32_t expId) {
+ }
+ 
+ int APS5_VABI sceContentExportFromDataWithThumbnail(std::int32_t expId, const ContentExportParam* param, const ContentExportCallbackParam* contentCallbackParam, const char* thumbnailType, const ContentExportCallbackParam* thumbnailCallbackParam, char* path, std::size_t pathBufferLength) {
+-    std::lock_guard lock(g_sessionMutex);
+-    RequireSession(__func__, expId);
+-    NotImplemented_nid_no_patch(__func__);
+-    return 0;
++    return ExportCanceled(__func__, expId, path, pathBufferLength);
+ }
+ 
+ int APS5_VABI sceContentExportTerm(void) {
+diff --git a/core/libs/tests/GuestContentExport.cpp b/core/libs/tests/GuestContentExport.cpp
+index 07036b1d9c..7e385d2e6a 100644
+--- a/core/libs/tests/GuestContentExport.cpp
++++ b/core/libs/tests/GuestContentExport.cpp
+@@ -60,6 +60,17 @@ int main() {
+     Require(sceContentExportTerm() == static_cast<int>(0x809D3003u));
+     int first = *sessions.begin();
+     Require(sceContentExportCancel(first) == static_cast<int>(0x809D3002u));
++    {
++        // Exports end as cancelled instead of aborting the game (pcportastrobot #73).
++        ContentExportParam exportParam{};
++        path[0] = 'x';
++        Require(sceContentExportFromData(first, &exportParam, 0, nullptr, nullptr, path, sizeof(path)) == static_cast<int>(0x809D3001u));
++        Require(path[0] == '\0');
++        Require(sceContentExportFromFile(first, &exportParam, "/data/x.png", path, sizeof(path)) == static_cast<int>(0x809D3001u));
++        ContentExportCallbackParam content{};
++        ContentExportCallbackParam thumbnail{};
++        Require(sceContentExportFromDataWithThumbnail(first, &exportParam, &content, "image/png", &thumbnail, path, sizeof(path)) == static_cast<int>(0x809D3001u));
++    }
+     Require(sceContentExportFinish(first) == 0);
+     Require(Throws<std::invalid_argument>([&] { sceContentExportFinish(first); }));
+     Require(Throws<std::invalid_argument>([&] { sceContentExportGetProgress(first); }));
+@@ -84,9 +95,9 @@ int main() {
+     Require(Throws<std::runtime_error>([] { sceContentExportDataProvideFunction(); }));
+     Require(Throws<std::runtime_error>([] { sceContentExportFree(); }));
+     Require(Throws<std::runtime_error>([] { sceContentExportFrom(); }));
+-    Require(Throws<std::runtime_error>([] { sceContentExportFromFileForSf(0, nullptr, nullptr, nullptr, nullptr, nullptr, 0); }));
+-    Require(Throws<std::runtime_error>([] { sceContentExportFromFileWithContentIdList(0, nullptr, nullptr, nullptr, nullptr, 0, nullptr, 0); }));
+-    Require(Throws<std::runtime_error>([] { sceContentExportFromFileWithTitleIdList(0, nullptr, nullptr, nullptr, nullptr, nullptr, 0); }));
++    Require(Throws<std::logic_error>([] { sceContentExportFromFileForSf(0, nullptr, nullptr, nullptr, nullptr, nullptr, 0); }));
++    Require(Throws<std::logic_error>([] { sceContentExportFromFileWithContentIdList(0, nullptr, nullptr, nullptr, nullptr, 0, nullptr, 0); }));
++    Require(Throws<std::logic_error>([] { sceContentExportFromFileWithTitleIdList(0, nullptr, nullptr, nullptr, nullptr, nullptr, 0); }));
+     Require(Throws<std::runtime_error>([] { sceContentExportInit(nullptr); }));
+     Require(Throws<std::runtime_error>([] { sceContentExportMalloc(); }));
+     Require(Throws<std::runtime_error>([] { sceContentExportRemoveFromFavorites(0); }));
+-- 
+2.55.0.windows.5
+

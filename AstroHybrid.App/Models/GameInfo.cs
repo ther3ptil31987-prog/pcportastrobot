@@ -11,6 +11,9 @@ namespace AstroHybrid.App.Models
         public string Version { get; set; } = "";
         public bool IsValid { get; set; }
         public string? ValidationError { get; set; }
+        // A valid dump that is known to have problems (for example a game version that crashes): shown to the
+        // player before setup, never a refusal.
+        public string? Warning { get; set; }
         public DateTime? LastValidated { get; set; }
     }
 
@@ -31,6 +34,8 @@ namespace AstroHybrid.App.Models
         public bool SupportsFrameGeneration { get; set; } = false;
         public bool SupportsReflex { get; set; } = false;
         public int MaxFrameGenMultiplier { get; set; } = 1;
+        // Dedicated video memory in MiB from the display driver's registry entry; 0 when unknown.
+        public int VramMb { get; set; } = 0;
 
         public string KindLabel => IsDiscrete ? "discrete" : IsIntegrated ? "integrated" : "graphics";
 

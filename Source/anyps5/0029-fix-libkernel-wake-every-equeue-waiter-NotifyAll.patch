@@ -1,0 +1,44 @@
+From bb5f554babd837a1c307ab6d3378036ffeb3de7a Mon Sep 17 00:00:00 2001
+From: Local Build <local@invalid>
+Date: Wed, 18 Nov 2026 13:47:47 +0000
+Subject: fix(libkernel): wake every equeue waiter (NotifyAll)
+
+A lost wakeup with NotifyOne can leave a waiter asleep while events are pending (game logic stalls while rendering continues). Backport of AnyPS5 daad982457 (#7492); shipped in AstroHybrid 1.2.0.
+---
+ core/libs/prx/libkernel/Equeue/Equeue.cpp | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/core/libs/prx/libkernel/Equeue/Equeue.cpp b/core/libs/prx/libkernel/Equeue/Equeue.cpp
+index c3d1691407..787508e59f 100644
+--- a/core/libs/prx/libkernel/Equeue/Equeue.cpp
++++ b/core/libs/prx/libkernel/Equeue/Equeue.cpp
+@@ -502,7 +502,7 @@ int KernelEqueuePrivate::AddEvent(const KernelEqueueEvent& event) {
+     } else {
+         m_events.push_back(event);
+     }
+-    m_cond.NotifyOne();
++    m_cond.NotifyAll();
+     WakePollers();
+     return EQUEUE_OK;
+ }
+@@ -527,7 +527,7 @@ int KernelEqueuePrivate::TriggerEvent(uintptr_t ident, int16_t filter, void* tri
+             it->triggered = true;
+         }
+     }
+-    m_cond.NotifyOne();
++    m_cond.NotifyAll();
+     WakePollers();
+     return EQUEUE_OK;
+ }
+@@ -556,7 +556,7 @@ int KernelEqueuePrivate::EditEvent(uintptr_t ident, int16_t filter, const std::f
+         return SCE_KERNEL_ERROR_ENOENT;
+     }
+     edit(*it);
+-    m_cond.NotifyOne();
++    m_cond.NotifyAll();
+     WakePollers();
+     return EQUEUE_OK;
+ }
+-- 
+2.55.0.windows.5
+

@@ -1,0 +1,55 @@
+From bcf8b6c70cf2b0d18f2fbeca86f8c63a798e1b76 Mon Sep 17 00:00:00 2001
+From: Local Build <local@invalid>
+Date: Tue, 17 Nov 2026 02:19:23 +0000
+Subject: fix(hybrid): restore automatic DualSense speaker routing
+
+---
+ src/libs/dualSenseHaptics.cpp | 24 +++++++++++++++++++-----
+ 1 file changed, 19 insertions(+), 5 deletions(-)
+
+diff --git a/src/libs/dualSenseHaptics.cpp b/src/libs/dualSenseHaptics.cpp
+index 21d01299..a2e6a36a 100644
+--- a/src/libs/dualSenseHaptics.cpp
++++ b/src/libs/dualSenseHaptics.cpp
+@@ -23,6 +23,9 @@ struct Stream {
+ 	DualSenseBluetooth::Stream* bluetooth  = nullptr;
+ 	SDL_AudioDeviceID           device     = 0;
+ 	uint64_t                    next_check = 0;
++	uint16_t                    last_rumble_low  = 0;
++	uint16_t                    last_rumble_high = 0;
++	uint64_t                    next_rumble_ms   = 0;
+ 	std::vector<float>          buffer;
+ };
+ 
+@@ -396,12 +399,23 @@ uint64_t Queue(Stream* stream, int controller, const void* data, uint32_t frames
+ 		const auto to_motor = [](float v) {
+ 			return static_cast<uint16_t>(std::clamp(v * 2.0f, 0.0f, 1.0f) * 65535.0f);
+ 		};
+-		SDL_LockJoysticks();
+-		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(controller));
+-		    pad != nullptr) {
+-			(void) SDL_RumbleGamepad(pad, to_motor(peak[0]), to_motor(peak[1]), 100);
++		const uint16_t low  = to_motor(peak[0]);
++		const uint16_t high = to_motor(peak[1]);
++		const uint64_t now  = SDL_GetTicks();
++		const bool     active      = low != 0 || high != 0;
++		const bool     was_active  = stream->last_rumble_low != 0 || stream->last_rumble_high != 0;
++		const bool     changed     = low != stream->last_rumble_low || high != stream->last_rumble_high;
++		if ((active && (changed || now >= stream->next_rumble_ms)) || (!active && was_active)) {
++			SDL_LockJoysticks();
++			if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(controller));
++			    pad != nullptr) {
++				(void) SDL_RumbleGamepad(pad, low, high, 100);
++			}
++			SDL_UnlockJoysticks();
++			stream->last_rumble_low  = low;
++			stream->last_rumble_high = high;
++			stream->next_rumble_ms   = now + 16;
+ 		}
+-		SDL_UnlockJoysticks();
+ 		return static_cast<uint64_t>(frames) * 1000000 / stream->freq;
+ 	}
+ 	const bool wireless = IsWireless(controller);
+-- 
+2.55.0.windows.5
+

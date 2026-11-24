@@ -1,0 +1,68 @@
+From 0ffce13f18185865650bc92180b334b207cf5336 Mon Sep 17 00:00:00 2001
+From: Marcelo Fernandes <marcelo_fis@hotmail.com>
+Date: Sun, 15 Nov 2026 22:28:57 -0300
+Subject: [PATCH 1/2] feat(hybrid): accept ultrawide render aspects for DLSS
+ Frame Generation
+
+NoteFrameGenCamera recognised the game's per-view constants by requiring the
+projection's horizontal/vertical scale ratio (m[5]/m[0]) to be 1.6..1.9, i.e.
+16:9 only. The render-aspect patch AstroHybrid offers for ultrawide displays
+changes that ratio to the display aspect, so on 21:9 (2.389) and 32:9 (3.556)
+the camera was never recognised (the log said "camera no") and frame
+generation lost the matrices it needs.
+
+Accept any plausible aspect from 1.0 (square) to 4.0; the remaining checks
+already pin the projection's shape, so widening the range cannot match other
+buffers. 21:9 and 32:9 now report "camera yes" and frame generation works.
+
+Also print the first few accepted projections (m[0], m[5], aspect, vertical
+FOV) so a render-aspect patch can be checked from the log: a hor+ patch keeps
+m[5] fixed while m[0] shrinks with 1/aspect.
+---
+ src/graphics/host_gpu/renderer/dlss.cpp | 27 +++++++++++++++++++++----
+ 1 file changed, 23 insertions(+), 4 deletions(-)
+
+diff --git a/src/graphics/host_gpu/renderer/dlss.cpp b/src/graphics/host_gpu/renderer/dlss.cpp
+index d43372e..d4158de 100644
+--- a/src/graphics/host_gpu/renderer/dlss.cpp
++++ b/src/graphics/host_gpu/renderer/dlss.cpp
+@@ -285,16 +285,35 @@ void RenderExecutor::NoteFrameGenCamera(const PreparedBindings& stage) {
+ 	if (!FrameGen::CameraWanted()) {
+ 		return;
+ 	}
+-	// The game's per-view constants: a perspective projection (16:9) at offset 128 of a 576-byte
+-	// buffer, followed by the view matrix and the inverse projection (frameGen.h).
++	// The game's per-view constants: a perspective projection at offset 128 of a 576-byte buffer,
++	// followed by the view matrix and the inverse projection (frameGen.h). The projection's
++	// horizontal/vertical scale ratio (m[5]/m[0]) is the render aspect, which the AstroHybrid
++	// ultrawide patch sets to the display aspect: 16:9 (1.778), 21:9 (2.389) or 32:9 (3.556).
++	// Accept every aspect from square (1.0) to 32:9 and a little beyond so ultrawide displays keep
++	// the camera matrices frame generation needs; the remaining checks already pin the shape.
++	constexpr float kMinCameraAspect = 1.0f;
++	constexpr float kMaxCameraAspect = 4.0f;
+ 	for (const auto& source: stage.buffer_sources) {
+ 		if (source.address == 0 || source.size != 576) {
+ 			continue;
+ 		}
+ 		const auto* m = reinterpret_cast<const float*>(source.address + 128);
+ 		const auto zero = [](float v) { return std::fabs(v) < 1e-6f; };
+-		if (!(m[0] > 0.2f && m[5] > 0.2f) || m[5] / m[0] < 1.6f || m[5] / m[0] > 1.9f || !zero(m[1]) ||
+-		    !zero(m[4]) || !zero(m[15]) || std::fabs(std::fabs(m[11]) - 1.0f) > 1e-5f) {
++		const auto aspect = m[5] / m[0];
++		const bool shape  = m[0] > 0.2f && m[5] > 0.2f && zero(m[1]) && zero(m[4]) && zero(m[15]) &&
++		                   std::fabs(std::fabs(m[11]) - 1.0f) <= 1e-5f;
++		// Diagnostic (first few candidates per session): the projection the game submits, so a
++		// render-aspect patch can be checked from the log (m[5] is the vertical scale: a hor+ patch
++		// keeps it fixed while m[0] shrinks with 1/aspect).
++		static int probe_printed = 0;
++		if (shape && probe_printed < 3) {
++			probe_printed++;
++			std::printf("DLSS-G: camera projection m[0]=%.6f m[5]=%.6f aspect=%.6f vfov=%.4f deg\n",
++			            static_cast<double>(m[0]), static_cast<double>(m[5]), static_cast<double>(aspect),
++			            2.0 * std::atan(1.0 / static_cast<double>(m[5])) * 57.29577951308232);
++			std::fflush(stdout);
++		}
++		if (!shape || aspect < kMinCameraAspect || aspect > kMaxCameraAspect) {
+ 			continue;
+ 		}
+ 		FrameGen::SetCamera(m);

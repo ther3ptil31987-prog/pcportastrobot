@@ -1,0 +1,2220 @@
+From 501b7692084276364a9665b430241f31728c8ae2 Mon Sep 17 00:00:00 2001
+From: mlmarcus <89200427+mlmarcus@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 01:09:28 -0700
+Subject: [PATCH] feat(framegen): AMD FSR frame generation through the AMD FSR
+ SDK 2.4 runtime
+
+ASTROHYBRID_FSRFG=1 turns on AMD FSR frame generation (one generated frame per rendered frame) on any
+Vulkan GPU with three spare queues in its graphics family (renderer/fsr.cpp, fsr.h). Kyty's swapchain
+is created through FSR's frame-interpolation swapchain (acquire/present through its replacement
+functions, the presented image left in SHADER_READ_ONLY_OPTIMAL); the frame hooks are DLSS-G's
+(frameGen.cpp forwards them when FSR FG is requested): the camera from the game's per-view constants,
+and at the temporal upscale pass copies of depth (R32F) and motion vectors into a small ring sized for
+the largest render size seen. Prepare (PrepareV2) and the interpolation are recorded in the swapchain's
+frame generation callback on the present thread; a frame without inputs shows the real frame twice.
+
+Runtime: the SDK's signed amd_fidelityfx_loader_vk.dll (the one FSR upscaling, fsr.inc, already loads)
+and amd_fidelityfx_framegeneration_vk.dll next to it, from ASTROHYBRID_FSR_PATH or the folder of
+kyty_gpu.dll; headers only at build time (KYTY_FFX_SDK_DIR, framegeneration/include added). The
+version structures SDK 2.1+ requires are chained; teardown follows the SDK 2.4 order (frame generation
+configured off, its context destroyed, the swapchain context destroyed, then the swapchain handle
+through pOutDestroySwapchainFFXAPI). The device-proc-address callback falls back to the core name
+for *KHR functions Kyty's device has as core Vulkan 1.1+ (the backend asked for
+vkGetBufferMemoryRequirements2KHR unchecked and crashed on the first run).
+
+It works with the game's own upscaling, DLSS and FSR upscaling; DLSS-G (ASTROHYBRID_DLSSG) wins when
+both are requested, and VK_NV_low_latency2 stays off with it. While it is on the image cache budget
+leaves 1 GiB more video memory free (vma.cpp). One "FSR FG 10s:" line every 10 s ends with the video
+memory in use. Options: ASTROHYBRID_FSRFG_ASYNC=0, ASTROHYBRID_FSRFG_DEBUG=1, ASTROHYBRID_FSRFG_HUD=0
+(a HUD-less copy of the display buffer; its capture point does not trigger in Astro Bot yet).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ CMakeLists.txt                                |    8 +-
+ src/graphics/host_gpu/renderer/dlss.cpp       |   75 +
+ src/graphics/host_gpu/renderer/frameGen.cpp   |   84 +-
+ src/graphics/host_gpu/renderer/fsr.cpp        | 1383 +++++++++++++++++
+ src/graphics/host_gpu/renderer/fsr.h          |  111 ++
+ src/graphics/host_gpu/renderer/render.h       |    4 +
+ src/graphics/host_gpu/renderer/renderDraw.cpp |   14 +
+ src/graphics/host_gpu/vma.cpp                 |   11 +-
+ .../presentation/window/lowLatency.cpp        |    3 +-
+ .../presentation/window/swapchain.cpp         |   74 +-
+ .../presentation/window/vulkanWindow.cpp      |   36 +-
+ 11 files changed, 1763 insertions(+), 40 deletions(-)
+ create mode 100644 src/graphics/host_gpu/renderer/fsr.cpp
+ create mode 100644 src/graphics/host_gpu/renderer/fsr.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c4126f4..6e88d94 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -2594,12 +2594,14 @@ if(KYTY_NGX_SDK_DIR)
+ 	target_include_directories(kyty_emulator PRIVATE "${KYTY_NGX_SDK_DIR}/include")
+ 	target_link_libraries(kyty_emulator "${KYTY_NGX_SDK_DIR}/lib/Windows_x86_64/nvsdk_ngx_d.lib")
+ endif()
+-# AstroHybrid: AMD FSR upscaling through the AMD FSR SDK 2.4 API (renderer/fsr.inc), headers only; the
+-# signed runtime DLLs are loaded at run time. Set to the SDK's Kits/FidelityFX folder; empty: not built in.
++# AstroHybrid: AMD FSR upscaling (renderer/fsr.inc) and AMD FSR frame generation (renderer/fsr.cpp)
++# through the AMD FSR SDK 2.4 API, headers only; the signed runtime DLLs are loaded at run time. Set to
++# the SDK's Kits/FidelityFX folder; empty: not built in.
+ set(KYTY_FFX_SDK_DIR "" CACHE PATH "AMD FSR SDK Kits/FidelityFX folder (FSR); empty to build without it")
+ if(KYTY_FFX_SDK_DIR)
+ 	target_compile_definitions(kyty_emulator PRIVATE KYTY_FFX=1)
+-	target_include_directories(kyty_emulator PRIVATE "${KYTY_FFX_SDK_DIR}/api/include" "${KYTY_FFX_SDK_DIR}/upscalers/include")
++	target_include_directories(kyty_emulator PRIVATE "${KYTY_FFX_SDK_DIR}/api/include" "${KYTY_FFX_SDK_DIR}/upscalers/include"
++	                           "${KYTY_FFX_SDK_DIR}/framegeneration/include")
+ endif()
+ # AstroHybrid: DLSS Frame Generation through Streamline (renderer/frameGen.cpp), headers only;
+ # sl.interposer.dll is loaded at run time. Empty: not built in.
+diff --git a/src/graphics/host_gpu/renderer/dlss.cpp b/src/graphics/host_gpu/renderer/dlss.cpp
+index 78fa8ca..2bcd6f3 100644
+--- a/src/graphics/host_gpu/renderer/dlss.cpp
++++ b/src/graphics/host_gpu/renderer/dlss.cpp
+@@ -1,5 +1,6 @@
+ #include "graphics/host_gpu/renderer/dlss.h"
+ #include "graphics/host_gpu/renderer/frameGen.h"
++#include "graphics/host_gpu/renderer/fsr.h"
+ 
+ #include "graphics/host_gpu/renderer/cache/textureCache.h"
+ #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+@@ -420,6 +421,80 @@ void RenderExecutor::TagFrameGen(CommandBuffer& buffer, PreparedBindings& pixel)
+ 	});
+ }
+ 
++namespace {
++// The cache images of the display buffers (render thread, under the render mutex).
++struct HudTarget {
++	uint64_t address = 0;
++	ImageId  image {};
++};
++std::array<HudTarget, 4> g_hud_targets {};
++uint32_t                 g_hud_target_next = 0;
++} // namespace
++
++void RenderExecutor::NoteHudlessTarget(const RenderColorInfo& color) {
++	const uint64_t address = color.desc.info.data.address;
++	if (!color.image_id || !Fsr::DisplayAddress(address)) {
++		return;
++	}
++	for (auto& target: g_hud_targets) {
++		if (target.address == address) {
++			target.image = color.image_id;
++			return;
++		}
++	}
++	g_hud_targets[g_hud_target_next++ % g_hud_targets.size()] = {address, color.image_id};
++}
++
++void RenderExecutor::NoteHudlessDraw(CommandBuffer& buffer) {
++	const auto& registers = buffer.GetRegisters();
++	if ((registers.GetRenderTargetMask() & 0xfu) == 0) {
++		return;
++	}
++	const auto&    target  = registers.GetRenderTarget(0);
++	const uint64_t address = target.base.addr;
++	if (address == 0) {
++		return;
++	}
++	// A blend that replaces the target (one, zero) is not one.
++	const auto& blend   = registers.GetBlendControl(0);
++	const bool  blended = blend.enable && !(blend.color_srcblend == 1 && blend.color_destblend == 0);
++	if (!Fsr::HudlessDraw(address, target.attrib2.width + 1u, target.attrib2.height + 1u, blended)) {
++		return;
++	}
++	Image* image = nullptr;
++	for (const auto& known: g_hud_targets) {
++		if (known.address == address && known.image) {
++			image = m_context.GetTextureCache().m_slot_images.try_get(known.image);
++		}
++	}
++	if (image == nullptr || image->backing.image == nullptr || image->info.data.address != address ||
++	    image->info.samples != 1 || image->backing.layers != 1 || !image->backing.subresource_states.empty() ||
++	    image->backing.state.layout == vk::ImageLayout::eUndefined) {
++		Fsr::HudlessUnavailable();
++		return;
++	}
++	// Nothing of the draw is prepared yet: the copy is recorded between two rendering instances,
++	// with barriers of its own that leave the image in the state the cache tracks.
++	buffer.EndRendering();
++	const auto cmd    = buffer.Handle();
++	const auto access = static_cast<uint64_t>(static_cast<VkAccessFlags2>(image->backing.state.access_mask));
++	Fsr::CaptureHudless(static_cast<VkCommandBuffer>(cmd), static_cast<VkImage>(image->backing.image),
++	                    static_cast<VkFormat>(image->backing.format), image->backing.extent.width,
++	                    image->backing.extent.height, static_cast<VkImageLayout>(image->backing.state.layout),
++	                    static_cast<VkAccessFlags>(access & 0xffffffffull) |
++	                        ((access >> 32) != 0 ? VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT : 0u),
++	                    address);
++	// No draw-run record is continued across it.
++	m_run.valid        = false;
++	m_run_prev_valid   = false;
++	m_run_keepable     = false;
++	m_run_active       = false;
++	m_run_targets_kept = false;
++	for (auto& record: m_run_kept) {
++		record.valid = false;
++	}
++}
++
+ void RenderExecutor::NoteDlssTargets(std::span<const RenderColorInfo> colors, ImageId depth) {
+ 	if ((!Dlss::Requested() && !FrameGen::Requested() && !Fsr::Requested()) || !depth) {
+ 		return;
+diff --git a/src/graphics/host_gpu/renderer/frameGen.cpp b/src/graphics/host_gpu/renderer/frameGen.cpp
+index 80f8eab..7ec3462 100644
+--- a/src/graphics/host_gpu/renderer/frameGen.cpp
++++ b/src/graphics/host_gpu/renderer/frameGen.cpp
+@@ -1,5 +1,7 @@
+ #include "graphics/host_gpu/renderer/frameGen.h"
+ 
++#include "graphics/host_gpu/renderer/fsr.h"
++
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
+@@ -29,18 +31,26 @@
+ 
+ namespace Libs::Graphics::FrameGen {
+ 
+-bool Requested() {
++namespace {
++// DLSS Frame Generation through Streamline. ASTROHYBRID_FSRFG (fsr.h) is the other frame
++// generator: it is off when this one is requested, and takes these hooks otherwise.
++bool StreamlineRequested() {
+ 	static const bool requested = [] {
+ 		const char* value = std::getenv("ASTROHYBRID_DLSSG");
+ 		return value != nullptr && std::strcmp(value, "1") == 0;
+ 	}();
+ 	return requested;
+ }
++} // namespace
++
++bool Requested() {
++	return StreamlineRequested() || Fsr::FrameGenRequested();
++}
+ 
+ #if !KYTY_STREAMLINE
+ 
+ PFN_vkGetInstanceProcAddr LoaderBeforeInstance() {
+-	if (Requested()) {
++	if (StreamlineRequested()) {
+ 		std::printf("DLSS-G: not built in (KYTY_STREAMLINE_DIR)\n");
+ 	}
+ 	return nullptr;
+@@ -50,24 +60,33 @@ bool Loaded() {
+ 	return false;
+ }
+ bool Active() {
+-	return false;
++	return Fsr::FrameGenActive();
+ }
+ void GuestFrameEnd(uint64_t) {}
+-void RenderSubmitted(uint64_t) {}
+-void PresentStart(uint64_t) {}
+-void PresentEnd(uint64_t) {}
++void RenderSubmitted(uint64_t frame) {
++	Fsr::RenderSubmitted(frame);
++}
++void PresentStart(uint64_t frame) {
++	Fsr::PresentStart(frame);
++}
++void PresentEnd(uint64_t frame) {
++	Fsr::PresentEnd(frame);
++}
+ uint64_t CurrentFrame() {
+-	return 0;
++	return Fsr::CurrentFrame();
+ }
+ bool CameraWanted() {
+-	return false;
++	return Fsr::CameraWanted();
+ }
+ double ShownPerGameFrame() {
+-	return 1.0;
++	return Fsr::ShownPerGameFrame();
+ }
+-void SetCamera(const float*) {}
+-bool TagFrame(VkCommandBuffer, const ImageInput&, const ImageInput&, const float*, uint32_t, uint32_t) {
+-	return false;
++void SetCamera(const float* constants) {
++	Fsr::SetCamera(constants);
++}
++bool TagFrame(VkCommandBuffer cmd, const ImageInput& depth, const ImageInput& motion, const float* jitter_uv,
++              uint32_t width, uint32_t height) {
++	return Fsr::TagFrame(cmd, depth, motion, jitter_uv, width, height);
+ }
+ 
+ #else
+@@ -252,7 +271,7 @@ void Summary() {
+ } // namespace
+ 
+ PFN_vkGetInstanceProcAddr LoaderBeforeInstance() {
+-	if (!Requested()) {
++	if (!StreamlineRequested()) {
+ 		return nullptr;
+ 	}
+ 	auto&        s          = Get();
+@@ -380,12 +399,12 @@ bool Loaded() {
+ }
+ 
+ bool Active() {
+-	return Get().active.load(std::memory_order_acquire);
++	return Get().active.load(std::memory_order_acquire) || Fsr::FrameGenActive();
+ }
+ 
+ void GuestFrameEnd(uint64_t frame) {
+ 	auto& s = Get();
+-	if (!Active()) {
++	if (!s.active.load(std::memory_order_acquire)) {
+ 		return;
+ 	}
+ 	Marker(sl::PCLMarker::eSimulationEnd, frame);
+@@ -398,6 +417,7 @@ void GuestFrameEnd(uint64_t frame) {
+ 
+ void RenderSubmitted(uint64_t frame) {
+ 	auto& s = Get();
++	Fsr::RenderSubmitted(frame);
+ 	s.cp_frame.store(frame, std::memory_order_release);
+ 	Marker(sl::PCLMarker::eRenderSubmitEnd, frame);
+ 	Marker(sl::PCLMarker::eRenderSubmitStart, frame + 1);
+@@ -447,12 +467,20 @@ void Adapt() {
+ } // namespace
+ 
+ void PresentStart(uint64_t frame) {
++	if (Fsr::FrameGenActive()) {
++		Fsr::PresentStart(frame);
++		return;
++	}
+ 	Marker(sl::PCLMarker::ePresentStart, frame);
+ }
+ 
+ void PresentEnd(uint64_t frame) {
++	if (Fsr::FrameGenActive()) {
++		Fsr::PresentEnd(frame);
++		return;
++	}
+ 	Marker(sl::PCLMarker::ePresentEnd, frame);
+-	if (Active()) {
++	if (Get().active.load(std::memory_order_acquire)) {
+ 		auto&              s = Get();
+ 		sl::ViewportHandle viewport {0};
+ 		sl::DLSSGState     state {};
+@@ -471,20 +499,33 @@ void PresentEnd(uint64_t frame) {
+ }
+ 
+ uint64_t CurrentFrame() {
++	if (Fsr::FrameGenActive()) {
++		return Fsr::CurrentFrame();
++	}
+ 	return Get().cp_frame.load(std::memory_order_acquire) + 1;
+ }
+ 
+ double ShownPerGameFrame() {
+-	return Active() ? Get().shown_ratio.load(std::memory_order_relaxed) : 1.0;
++	if (Fsr::FrameGenActive()) {
++		return Fsr::ShownPerGameFrame();
++	}
++	return Get().active.load(std::memory_order_acquire) ? Get().shown_ratio.load(std::memory_order_relaxed) : 1.0;
+ }
+ 
+ bool CameraWanted() {
++	if (Fsr::CameraWanted()) {
++		return true;
++	}
+ 	auto& s = Get();
+-	return Active() && s.camera_wanted;
++	return s.active.load(std::memory_order_acquire) && s.camera_wanted;
+ }
+ 
+ void SetCamera(const float* c) {
+-	auto&            s = Get();
++	Fsr::SetCamera(c);
++	auto& s = Get();
++	if (!s.active.load(std::memory_order_acquire)) {
++		return;
++	}
+ 	std::scoped_lock lock(s.camera_mutex);
+ 	Mat projection {};
+ 	Mat view {};
+@@ -500,8 +541,11 @@ void SetCamera(const float* c) {
+ 
+ bool TagFrame(VkCommandBuffer cmd, const ImageInput& depth, const ImageInput& motion,
+               const float jitter_uv[2], uint32_t width, uint32_t height) {
++	if (Fsr::FrameGenActive()) {
++		return Fsr::TagFrame(cmd, depth, motion, jitter_uv, width, height);
++	}
+ 	auto& s = Get();
+-	if (!Active()) {
++	if (!s.active.load(std::memory_order_acquire)) {
+ 		return false;
+ 	}
+ 	const uint64_t frame = CurrentFrame();
+diff --git a/src/graphics/host_gpu/renderer/fsr.cpp b/src/graphics/host_gpu/renderer/fsr.cpp
+new file mode 100644
+index 0000000..b1246a7
+--- /dev/null
++++ b/src/graphics/host_gpu/renderer/fsr.cpp
+@@ -0,0 +1,1383 @@
++#include "graphics/host_gpu/renderer/fsr.h"
++
++#include "graphics/host_gpu/vulkanCommon.h"
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <string>
++#include <utility>
++#include <vector>
++
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
++
++#if KYTY_FFX
++// AMD FSR SDK 2.4 (KYTY_FFX_SDK_DIR: api/include and framegeneration/include).
++#include <ffx_api.h>
++#include <ffx_api_types.h>
++#include <ffx_framegeneration.h>
++#include <vk/ffx_api_framegeneration_vk.h>
++#include <vk/ffx_api_vk.h>
++#endif
++
++namespace Libs::Graphics::Fsr {
++
++namespace {
++
++bool EnvIs(const char* name, const char* expected) {
++	const char* value = std::getenv(name);
++	return value != nullptr && std::strcmp(value, expected) == 0;
++}
++
++} // namespace
++
++bool FrameGenRequested() {
++	// DLSS Frame Generation owns the swapchain through Streamline when it is requested.
++	static const bool requested = EnvIs("ASTROHYBRID_FSRFG", "1") && !EnvIs("ASTROHYBRID_DLSSG", "1");
++	return requested;
++}
++
++#if !KYTY_FFX
++
++uint32_t ExtraQueues(uint32_t, uint32_t) {
++	return 0;
++}
++void OnDeviceReady(const DeviceInfo&) {
++	if (FrameGenRequested()) {
++		std::printf("FSR FG: not built in (KYTY_FFX_SDK_DIR)\n");
++	}
++}
++bool FrameGenActive() {
++	return false;
++}
++void RenderSubmitted(uint64_t) {}
++uint64_t CurrentFrame() {
++	return 0;
++}
++void PresentStart(uint64_t) {}
++void PresentEnd(uint64_t) {}
++double ShownPerGameFrame() {
++	return 1.0;
++}
++bool CameraWanted() {
++	return false;
++}
++void SetCamera(const float*) {}
++bool TagFrame(VkCommandBuffer, const FrameGen::ImageInput&, const FrameGen::ImageInput&, const float*, uint32_t,
++              uint32_t) {
++	return false;
++}
++bool CreateSwapchain(const VkSwapchainCreateInfoKHR&, VkSwapchainKHR*) {
++	return false;
++}
++bool OwnsSwapchain(VkSwapchainKHR) {
++	return false;
++}
++void DestroySwapchain(VkSwapchainKHR) {}
++VkResult GetSwapchainImages(VkSwapchainKHR, uint32_t*, VkImage*) {
++	return VK_ERROR_INITIALIZATION_FAILED;
++}
++VkResult AcquireNextImage(VkSwapchainKHR, uint64_t, VkSemaphore, VkFence, uint32_t*) {
++	return VK_ERROR_INITIALIZATION_FAILED;
++}
++VkResult QueuePresent(VkQueue, const VkPresentInfoKHR*) {
++	return VK_ERROR_INITIALIZATION_FAILED;
++}
++uint64_t NoteDisplayFrame(uint64_t, VkFormat, uint32_t, uint32_t) {
++	return 0;
++}
++bool HudlessDraw(uint64_t, uint32_t, uint32_t, bool) {
++	return false;
++}
++bool DisplayAddress(uint64_t) {
++	return false;
++}
++void CaptureHudless(VkCommandBuffer, VkImage, VkFormat, uint32_t, uint32_t, VkImageLayout, VkAccessFlags, uint64_t) {}
++void HudlessUnavailable() {}
++void SetPresentHudless(uint64_t) {}
++
++#else
++
++namespace {
++
++constexpr uint32_t SLOT_COUNT = 3;
++
++// Depth and motion vectors of one rendered frame, copied at the game's upscale pass.
++struct Slot {
++	uint64_t       frame = 0;
++	bool           valid = false;
++	uint32_t       width = 0, height = 0;            // the part in use (the frame's render size)
++	uint32_t       image_width = 0, image_height = 0; // the images' size: the largest render size seen
++	VkFormat       motion_format = VK_FORMAT_UNDEFINED;
++	VkImage        depth         = VK_NULL_HANDLE; // R32_SFLOAT
++	VkDeviceMemory depth_memory  = VK_NULL_HANDLE;
++	VkImage        motion        = VK_NULL_HANDLE;
++	VkDeviceMemory motion_memory = VK_NULL_HANDLE;
++	float          jitter[2] {};
++	float          frame_ms = 16.7f;
++	float          camera_near = 0.1f, camera_far = 1000.0f, camera_fov = 1.0f;
++	float          camera_position[3] {}, camera_up[3] {0, 1, 0}, camera_right[3] {1, 0, 0},
++	    camera_forward[3] {0, 0, -1};
++};
++
++// HUD-less colour: an image of the swapchain's size and format, or the copy of a display buffer in
++// the presenter's frame format it is scaled from.
++struct HudImage {
++	VkImage        image  = VK_NULL_HANDLE;
++	VkDeviceMemory memory = VK_NULL_HANDLE;
++	uint32_t       width = 0, height = 0;
++	VkFormat       format  = VK_FORMAT_UNDEFINED;
++	uint64_t       serial  = 0; // the token of the copy it holds (0: none)
++	uint64_t       address = 0; // the display buffer it was taken from
++};
++constexpr uint32_t HUD_COUNT = 4;
++
++// A run of draws into one colour target, for the log's description of the end of a frame.
++struct HudRun {
++	uint64_t address = 0;
++	uint32_t width = 0, height = 0;
++	uint32_t opaque = 0, blended = 0;
++	bool     display = false;
++	bool     copy    = false;
++};
++constexpr uint32_t HUD_RUNS = 10;
++
++enum class Skip : uint32_t { NoInputs, Repeat, NoContext, Prepare, Dispatch, Count };
++constexpr std::array<const char*, static_cast<size_t>(Skip::Count)> SKIP_NAMES {"no-inputs", "repeat", "no-context",
++                                                                               "prepare", "dispatch"};
++
++struct State {
++	// Library.
++	bool                 library_tried = false;
++	HMODULE              module        = nullptr;
++	PfnFfxCreateContext  create        = nullptr;
++	PfnFfxDestroyContext destroy       = nullptr;
++	PfnFfxConfigure      configure     = nullptr;
++	PfnFfxQuery          query         = nullptr;
++	PfnFfxDispatch       dispatch      = nullptr;
++
++	// Device.
++	DeviceInfo        device;
++	bool              depth_inverted = false;
++	float             jitter_sign    = 1.0f;
++	bool              async          = true;
++	bool              debug          = false;
++	std::atomic<bool> frame_gen_active {false};
++
++	// Swapchain and frame generation contexts (context_mutex).
++	std::mutex                                     context_mutex;
++	ffxCreateContextDescFrameGenerationSwapChainVK        swapchain_desc {};
++	ffxCreateContextDescFrameGenerationSwapChainVersionVK swapchain_version {};
++	ffxContext                                     swapchain_context = nullptr;
++	VkSwapchainKHR                                 swapchain         = VK_NULL_HANDLE;
++	ffxQueryDescSwapchainReplacementFunctionsVK    functions {};
++	VkExtent2D                                     display {};
++	VkFormat                                       display_format = VK_FORMAT_UNDEFINED;
++	bool                                           display_hdr    = false;
++	ffxCreateBackendVKDesc                         frame_gen_backend {};
++	ffxCreateContextDescFrameGeneration            frame_gen_desc {};
++	ffxCreateContextDescFrameGenerationVersion     frame_gen_version {};
++	ffxContext                                     frame_gen_context = nullptr;
++	bool                                           frame_gen_failed  = false;
++	bool                                           first_configure   = true;
++	uint64_t                                       configured_frame  = 0;
++	uint64_t                                       generated_frame   = 0;
++	bool                                           present_generated = false;
++
++	// Frames.
++	std::atomic<uint64_t>        cp_frame {0};
++	std::mutex                   slot_mutex;
++	std::array<Slot, SLOT_COUNT> slots {};
++	std::vector<Slot>            retired; // replaced by a larger size; freed with the process
++	int64_t                      tag_ns = 0;
++	// Depth goes through this buffer (render thread only; one command buffer at a time uses it,
++	// and the queue runs them in order).
++	VkBuffer       staging        = VK_NULL_HANDLE;
++	VkDeviceMemory staging_memory = VK_NULL_HANDLE;
++	VkDeviceSize   staging_size   = 0;
++
++	// HUD-less colour. Render thread (under the render mutex) unless noted.
++	bool                            hud_enabled = true;
++	std::atomic<uint32_t>           hud_display_width {0}, hud_display_height {0}, hud_display_format {0};
++	std::array<uint64_t, 4>         hud_addresses {}; // the display buffers flipped lately
++	uint32_t                        hud_address_next = 0;
++	VkFormat                        hud_frame_format = VK_FORMAT_UNDEFINED; // the presenter's frame
++	uint32_t                        hud_frame_width = 0, hud_frame_height = 0;
++	uint64_t                        hud_opaque_address = 0; // since the last flip: an unblended draw there
++	bool                            hud_tried          = false;
++	uint64_t                        hud_captured       = 0; // since the last flip: the copy's token
++	uint64_t                        hud_captured_address = 0;
++	std::mutex                      hud_mutex; // the ring's entries (render and present threads)
++	std::array<HudImage, HUD_COUNT> hud_ring {};
++	uint32_t                        hud_next   = 0;
++	uint64_t                        hud_serial = 0;
++	HudImage                        hud_source;
++	std::vector<HudImage>           hud_retired; // replaced by another size; freed with the process
++	HudImage                        present_hud; // present thread: the next present's
++	std::atomic<uint64_t>           hud_copies {0}, hud_unavailable {0};
++	uint64_t                        hud_used = 0; // context_mutex
++	std::array<HudRun, HUD_RUNS>    hud_runs {};
++	uint32_t                        hud_run_total = 0;
++	std::array<uint64_t, 16>        hud_tails {}; // frame ends already described in the log
++	uint32_t                        hud_tail_count = 0;
++
++	// Camera (camera_mutex).
++	std::mutex            camera_mutex;
++	std::atomic<bool>     camera_wanted {true};
++	bool                  camera_valid = false;
++	std::array<float, 16> projection {};
++	std::array<float, 16> view {};
++
++	// Statistics (present thread, except the atomics).
++	std::atomic<uint64_t>                                  tags {0};
++	uint64_t                                               presents = 0, generated = 0;
++	std::array<uint64_t, static_cast<size_t>(Skip::Count)> skips {};
++	std::atomic<double>                                    shown_ratio {1.0};
++	int64_t                                                print_ns = 0;
++	uint32_t                                               errors_logged = 0;
++};
++
++State& Get() {
++	static State state;
++	return state;
++}
++
++thread_local int t_queue_locked = 0;
++
++// The game queue is externally synchronized by GraphicContext::queue_mutex.
++struct QueueScope {
++	QueueScope() {
++		if (t_queue_locked++ == 0 && Get().device.queue_lock != nullptr) {
++			Get().device.queue_lock(true);
++		}
++	}
++	~QueueScope() {
++		if (--t_queue_locked == 0 && Get().device.queue_lock != nullptr) {
++			Get().device.queue_lock(false);
++		}
++	}
++	QueueScope(const QueueScope&)            = delete;
++	QueueScope& operator=(const QueueScope&) = delete;
++};
++
++VkResult SubmitGameQueue(uint32_t count, const VkSubmitInfo* submits, VkFence fence) {
++	QueueScope lock;
++	return VULKAN_HPP_DEFAULT_DISPATCHER.vkQueueSubmit(Get().device.game_queue, count, submits, fence);
++}
++
++// FSR's Vulkan backend asks for some functions by their extension names (it calls
++// vkGetBufferMemoryRequirements2KHR without a null check when the GPU supports dedicated
++// allocations). Kyty's device has them as core Vulkan 1.1+ functions without those extensions
++// enabled, so the loader answers null for the KHR name: the core name is tried then.
++PFN_vkVoidFunction VKAPI_CALL DeviceProcAddr(VkDevice device, const char* name) {
++	const auto real     = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr;
++	auto       function = real(device, name);
++	if (function == nullptr && name != nullptr) {
++		const size_t length = std::strlen(name);
++		if (length > 3 && std::strcmp(name + length - 3, "KHR") == 0) {
++			const std::string core(name, length - 3);
++			function = real(device, core.c_str());
++		}
++	}
++	return function;
++}
++
++int64_t NowNs() {
++	return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
++	    .count();
++}
++
++void Message(uint32_t type, const wchar_t* message) {
++	auto& s = Get();
++	if (s.errors_logged < 40) {
++		s.errors_logged++;
++		std::printf("FSR FG runtime %s: %ls\n", type == FFX_API_MESSAGE_TYPE_ERROR ? "error" : "warning", message);
++		std::fflush(stdout);
++	}
++}
++
++std::string ModuleFolder() {
++	HMODULE self = nullptr;
++	char    path[MAX_PATH] {};
++	if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++	                       reinterpret_cast<LPCSTR>(&ModuleFolder), &self) == 0 ||
++	    GetModuleFileNameA(self, path, MAX_PATH) == 0) {
++		return ".";
++	}
++	std::string text(path);
++	const auto  slash = text.find_last_of("\\/");
++	return slash == std::string::npos ? std::string(".") : text.substr(0, slash);
++}
++
++bool LoadFfx() {
++	auto& s = Get();
++	if (s.library_tried) {
++		return s.dispatch != nullptr;
++	}
++	s.library_tried        = true;
++	const char*       path = std::getenv("ASTROHYBRID_FSR_PATH");
++	const std::string folder = path != nullptr && path[0] != '\0' ? std::string(path) : ModuleFolder();
++	const std::string dll    = folder + "\\amd_fidelityfx_loader_vk.dll";
++	// The effect itself: the loader looks for it next to the game's executable and next to itself.
++	const std::string effect = folder + "\\amd_fidelityfx_framegeneration_vk.dll";
++	if (GetFileAttributesA(effect.c_str()) == INVALID_FILE_ATTRIBUTES) {
++		std::printf("FSR FG: %s is missing: off\n", effect.c_str());
++		std::fflush(stdout);
++		return false;
++	}
++	// The same loader as FSR upscaling (fsr.inc) when both are on: one module, separate contexts.
++	s.module = LoadLibraryExA(dll.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
++	if (s.module == nullptr) {
++		std::printf("FSR FG: cannot load %s (%lu): off\n", dll.c_str(), GetLastError());
++		std::fflush(stdout);
++		return false;
++	}
++	const auto symbol = [&](const char* name) { return reinterpret_cast<void*>(GetProcAddress(s.module, name)); };
++	s.create    = reinterpret_cast<PfnFfxCreateContext>(symbol("ffxCreateContext"));
++	s.destroy   = reinterpret_cast<PfnFfxDestroyContext>(symbol("ffxDestroyContext"));
++	s.configure = reinterpret_cast<PfnFfxConfigure>(symbol("ffxConfigure"));
++	s.query     = reinterpret_cast<PfnFfxQuery>(symbol("ffxQuery"));
++	auto dispatch = reinterpret_cast<PfnFfxDispatch>(symbol("ffxDispatch"));
++	if (s.create == nullptr || s.destroy == nullptr || s.configure == nullptr || s.query == nullptr ||
++	    dispatch == nullptr) {
++		std::printf("FSR FG: %s lacks an entry point: off\n", dll.c_str());
++		std::fflush(stdout);
++		return false;
++	}
++	s.dispatch = dispatch;
++	if (const char* value = std::getenv("ASTROHYBRID_FSR_DEPTH_INVERTED"); value != nullptr) {
++		s.depth_inverted = std::strcmp(value, "0") != 0;
++	} else if (const char* dlss = std::getenv("ASTROHYBRID_DLSS_DEPTH_INVERTED"); dlss != nullptr) {
++		s.depth_inverted = std::strcmp(dlss, "0") != 0;
++	}
++	if (const char* value = std::getenv("ASTROHYBRID_DLSS_JITTER_SIGN"); value != nullptr) {
++		s.jitter_sign = std::strtof(value, nullptr) < 0 ? -1.0f : 1.0f;
++	}
++	s.async       = !EnvIs("ASTROHYBRID_FSRFG_ASYNC", "0");
++	s.debug       = EnvIs("ASTROHYBRID_FSRFG_DEBUG", "1");
++	s.hud_enabled = !EnvIs("ASTROHYBRID_FSRFG_HUD", "0");
++	ffxConfigureDescGlobalDebug debug {};
++	debug.header.type = FFX_API_CONFIGURE_DESC_TYPE_GLOBALDEBUG;
++	debug.effectId    = FFX_API_EFFECT_ID_FRAMEGENERATION;
++	debug.fpMessage   = &Message;
++	debug.debugLevel  = FFX_API_CONFIGURE_GLOBALDEBUG_LEVEL_WARNINGS;
++	(void)s.configure(nullptr, &debug.header);
++	std::printf("FSR FG: %s loaded (depth inverted %d, jitter sign %+.0f)\n", dll.c_str(), s.depth_inverted ? 1 : 0,
++	            static_cast<double>(s.jitter_sign));
++	std::fflush(stdout);
++	return true;
++}
++
++FfxApiResource Resource(VkImage image, uint32_t format, uint32_t width, uint32_t height, uint32_t usage,
++                        uint32_t state) {
++	FfxApiResource r {};
++	r.resource             = reinterpret_cast<void*>(image);
++	r.description.type     = FFX_API_RESOURCE_TYPE_TEXTURE2D;
++	r.description.format   = format;
++	r.description.width    = width;
++	r.description.height   = height;
++	r.description.depth    = 1;
++	r.description.mipCount = 1;
++	r.description.flags    = FFX_API_RESOURCE_FLAGS_NONE;
++	r.description.usage    = usage;
++	r.state                = state;
++	return r;
++}
++
++// ---- Vulkan helpers (Kyty's dispatcher: the loader's functions, no prototypes). ----
++
++void Barrier(VkCommandBuffer cmd, VkImage image, VkImageAspectFlags aspect, VkImageLayout from, VkImageLayout to,
++             VkAccessFlags source_access, VkAccessFlags destination_access) {
++	VkImageMemoryBarrier barrier {};
++	barrier.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
++	barrier.srcAccessMask       = source_access;
++	barrier.dstAccessMask       = destination_access;
++	barrier.oldLayout           = from;
++	barrier.newLayout           = to;
++	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++	barrier.image               = image;
++	barrier.subresourceRange    = {aspect, 0, 1, 0, 1};
++	VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++	                                                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr,
++	                                                   1, &barrier);
++}
++
++bool Allocate(const VkMemoryRequirements& requirements, VkDeviceMemory& memory) {
++	auto&                            s = Get();
++	auto&                            d = VULKAN_HPP_DEFAULT_DISPATCHER;
++	VkPhysicalDeviceMemoryProperties properties {};
++	d.vkGetPhysicalDeviceMemoryProperties(s.device.physical_device, &properties);
++	for (uint32_t i = 0; i < properties.memoryTypeCount; i++) {
++		if ((requirements.memoryTypeBits & (1u << i)) != 0 &&
++		    (properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) {
++			VkMemoryAllocateInfo info {};
++			info.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++			info.allocationSize  = requirements.size;
++			info.memoryTypeIndex = i;
++			if (d.vkAllocateMemory(s.device.device, &info, nullptr, &memory) == VK_SUCCESS) {
++				return true;
++			}
++		}
++	}
++	return false;
++}
++
++bool CreateImage(VkFormat format, uint32_t width, uint32_t height, VkImage& image, VkDeviceMemory& memory) {
++	auto&             s = Get();
++	auto&             d = VULKAN_HPP_DEFAULT_DISPATCHER;
++	VkImageCreateInfo info {};
++	info.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++	info.imageType     = VK_IMAGE_TYPE_2D;
++	info.format        = format;
++	info.extent        = {width, height, 1};
++	info.mipLevels     = 1;
++	info.arrayLayers   = 1;
++	info.samples       = VK_SAMPLE_COUNT_1_BIT;
++	info.tiling        = VK_IMAGE_TILING_OPTIMAL;
++	info.usage         = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
++	info.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
++	info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++	if (d.vkCreateImage(s.device.device, &info, nullptr, &image) != VK_SUCCESS) {
++		return false;
++	}
++	VkMemoryRequirements requirements {};
++	d.vkGetImageMemoryRequirements(s.device.device, image, &requirements);
++	return Allocate(requirements, memory) && d.vkBindImageMemory(s.device.device, image, memory, 0) == VK_SUCCESS;
++}
++
++bool CreateBuffer(VkDeviceSize size, VkBuffer& buffer, VkDeviceMemory& memory) {
++	auto&              s = Get();
++	auto&              d = VULKAN_HPP_DEFAULT_DISPATCHER;
++	VkBufferCreateInfo info {};
++	info.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
++	info.size        = size;
++	info.usage       = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++	info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++	if (d.vkCreateBuffer(s.device.device, &info, nullptr, &buffer) != VK_SUCCESS) {
++		return false;
++	}
++	VkMemoryRequirements requirements {};
++	d.vkGetBufferMemoryRequirements(s.device.device, buffer, &requirements);
++	return Allocate(requirements, memory) && d.vkBindBufferMemory(s.device.device, buffer, memory, 0) == VK_SUCCESS;
++}
++
++bool DepthSupported(VkFormat format) {
++	return format == VK_FORMAT_D32_SFLOAT || format == VK_FORMAT_D32_SFLOAT_S8_UINT;
++}
++
++VkImageAspectFlags DepthLayoutAspect(VkFormat format) {
++	return format == VK_FORMAT_D32_SFLOAT_S8_UINT ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT
++	                                               : VK_IMAGE_ASPECT_DEPTH_BIT;
++}
++
++// The slot's images for this render size and motion format (motion VK_FORMAT_UNDEFINED: depth
++// only). The game's render size changes while playing (dynamic resolution), so the images only
++// grow: a smaller frame uses their top-left part. Replaced images are retired, not destroyed: a
++// submitted command buffer may still read them.
++bool PrepareSlot(Slot& slot, uint32_t width, uint32_t height, VkFormat motion_format) {
++	auto&              s    = Get();
++	const VkDeviceSize size = static_cast<VkDeviceSize>(width) * height * 4;
++	if (s.staging == VK_NULL_HANDLE || s.staging_size < size) {
++		// The old buffer (if any) stays alive for the command buffers that use it.
++		s.staging        = VK_NULL_HANDLE;
++		s.staging_memory = VK_NULL_HANDLE;
++		if (!CreateBuffer(size, s.staging, s.staging_memory)) {
++			s.staging = VK_NULL_HANDLE;
++			std::printf("FSR FG: cannot create the %ux%u depth staging buffer\n", width, height);
++			std::fflush(stdout);
++			return false;
++		}
++		s.staging_size = size;
++	}
++	if (slot.depth != VK_NULL_HANDLE && slot.image_width >= width && slot.image_height >= height &&
++	    slot.motion_format == motion_format) {
++		slot.width  = width;
++		slot.height = height;
++		return true;
++	}
++	const uint32_t image_width  = std::max(width, slot.image_width);
++	const uint32_t image_height = std::max(height, slot.image_height);
++	if (slot.depth != VK_NULL_HANDLE) {
++		s.retired.push_back(slot);
++	}
++	slot               = Slot {};
++	slot.width         = width;
++	slot.height        = height;
++	slot.image_width   = image_width;
++	slot.image_height  = image_height;
++	slot.motion_format = motion_format;
++	const bool ok = CreateImage(VK_FORMAT_R32_SFLOAT, image_width, image_height, slot.depth, slot.depth_memory) &&
++	                (motion_format == VK_FORMAT_UNDEFINED ||
++	                 CreateImage(motion_format, image_width, image_height, slot.motion, slot.motion_memory));
++	if (!ok) {
++		std::printf("FSR FG: cannot create the %ux%u input copies\n", image_width, image_height);
++		std::fflush(stdout);
++		slot.depth = VK_NULL_HANDLE;
++	}
++	return ok;
++}
++
++// The depth aspect into the slot's R32F image, through the staging buffer (a depth-to-colour image
++// copy needs VK_KHR_maintenance8). The source is in `layout` and is left in it.
++void CopyDepth(VkCommandBuffer cmd, const FrameGen::ImageInput& depth, Slot& slot) {
++	auto&      d       = VULKAN_HPP_DEFAULT_DISPATCHER;
++	const auto staging = Get().staging;
++	const auto aspect  = DepthLayoutAspect(depth.format);
++	Barrier(cmd, depth.image, aspect, depth.layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
++	        VK_ACCESS_TRANSFER_READ_BIT);
++	VkBufferImageCopy region {};
++	region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
++	region.imageExtent      = {slot.width, slot.height, 1};
++	d.vkCmdCopyImageToBuffer(cmd, depth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging, 1, &region);
++	Barrier(cmd, depth.image, aspect, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, depth.layout, VK_ACCESS_TRANSFER_READ_BIT,
++	        VK_ACCESS_SHADER_READ_BIT);
++	VkBufferMemoryBarrier buffer_barrier {};
++	buffer_barrier.sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
++	buffer_barrier.srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
++	buffer_barrier.dstAccessMask       = VK_ACCESS_TRANSFER_READ_BIT;
++	buffer_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++	buffer_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++	buffer_barrier.buffer              = staging;
++	buffer_barrier.size                = VK_WHOLE_SIZE;
++	d.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1,
++	                       &buffer_barrier, 0, nullptr);
++	Barrier(cmd, slot.depth, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++	        0, VK_ACCESS_TRANSFER_WRITE_BIT);
++	region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++	d.vkCmdCopyBufferToImage(cmd, staging, slot.depth, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
++	Barrier(cmd, slot.depth, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++	        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
++}
++
++void CopyMotion(VkCommandBuffer cmd, const FrameGen::ImageInput& motion, Slot& slot) {
++	auto& d = VULKAN_HPP_DEFAULT_DISPATCHER;
++	Barrier(cmd, motion.image, VK_IMAGE_ASPECT_COLOR_BIT, motion.layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++	        VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
++	Barrier(cmd, slot.motion, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++	        0, VK_ACCESS_TRANSFER_WRITE_BIT);
++	VkImageCopy region {};
++	region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++	region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++	region.extent         = {slot.width, slot.height, 1};
++	d.vkCmdCopyImage(cmd, motion.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slot.motion,
++	                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
++	Barrier(cmd, motion.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, motion.layout,
++	        VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT);
++	Barrier(cmd, slot.motion, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++	        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
++}
++
++// The camera of the frame being rendered into the slot (the game's per-view constants: the
++// projection, then the view matrix, row-major with row vectors, as frameGen.cpp reads them).
++void FillCamera(Slot& slot) {
++	auto&            s = Get();
++	std::scoped_lock lock(s.camera_mutex);
++	if (s.camera_valid) {
++		const auto& p = s.projection;
++		const auto& v = s.view;
++		const float a = p[10];
++		const float b = p[14];
++		const float near_plane = a != 0.0f ? std::fabs(b / a) : 0.1f;
++		const float far_plane  = a + 1.0f != 0.0f ? std::fabs(b / (a + 1.0f)) : 1000.0f;
++		if (std::isfinite(near_plane) && std::isfinite(far_plane) && near_plane > 0.0f && far_plane > 0.0f) {
++			slot.camera_near = std::min(near_plane, far_plane);
++			slot.camera_far  = std::max(near_plane, far_plane);
++		}
++		if (p[5] > 0.0f) {
++			slot.camera_fov = 2.0f * std::atan(1.0f / p[5]);
++		}
++		// The view matrix is a rotation and a translation: its inverse's rows are the camera's
++		// axes and position in world space.
++		for (int i = 0; i < 3; i++) {
++			slot.camera_right[i]    = v[i * 4 + 0];
++			slot.camera_up[i]       = v[i * 4 + 1];
++			slot.camera_forward[i]  = -v[i * 4 + 2];
++			slot.camera_position[i] = -(v[12] * v[i * 4 + 0] + v[13] * v[i * 4 + 1] + v[14] * v[i * 4 + 2]);
++		}
++	}
++	s.camera_wanted.store(true, std::memory_order_release);
++}
++
++// ---- HUD-less colour. ----
++
++// The image in this format and size. A replaced image is retired, not destroyed: a submitted
++// command buffer may still use it.
++bool EnsureHudImage(HudImage& image, VkFormat format, uint32_t width, uint32_t height) {
++	auto& s = Get();
++	if (image.image != VK_NULL_HANDLE && image.format == format && image.width == width && image.height == height) {
++		return true;
++	}
++	if (image.image != VK_NULL_HANDLE) {
++		s.hud_retired.push_back(image);
++	}
++	image = {};
++	if (!CreateImage(format, width, height, image.image, image.memory)) {
++		image = {};
++		return false;
++	}
++	image.format = format;
++	image.width  = width;
++	image.height = height;
++	return true;
++}
++
++// Once per kind of frame end: the last colour targets drawn into before the flip, with their
++// unblended (o) and blended (b) draws, the display buffers (D) and where the copy was taken.
++void LogFrameTail(uint64_t address, uint32_t width, uint32_t height, bool copied) {
++	auto&          s     = Get();
++	const uint32_t first = s.hud_run_total > HUD_RUNS ? s.hud_run_total - HUD_RUNS : 0;
++	uint64_t       hash  = 1469598103934665603ull;
++	const auto     mix   = [&hash](uint64_t value) { hash = (hash ^ value) * 1099511628211ull; };
++	for (uint32_t i = first; i < s.hud_run_total; i++) {
++		const auto& run = s.hud_runs[i % HUD_RUNS];
++		mix((static_cast<uint64_t>(run.width) << 32) | run.height);
++		mix((run.display ? 1u : 0u) | (run.opaque != 0 ? 2u : 0u) | (run.blended != 0 ? 4u : 0u) | (run.copy ? 8u : 0u));
++	}
++	mix(copied ? 3 : 2);
++	for (uint32_t i = 0; i < s.hud_tail_count; i++) {
++		if (s.hud_tails[i] == hash) {
++			return;
++		}
++	}
++	if (s.hud_tail_count >= s.hud_tails.size()) {
++		return;
++	}
++	s.hud_tails[s.hud_tail_count++] = hash;
++	std::string text;
++	for (uint32_t i = first; i < s.hud_run_total; i++) {
++		const auto& run = s.hud_runs[i % HUD_RUNS];
++		char        part[96];
++		std::snprintf(part, sizeof(part), "%s%s%ux%u o%u b%u%s", text.empty() ? "" : " > ", run.display ? "D " : "",
++		              run.width, run.height, run.opaque, run.blended, run.copy ? " (copy)" : "");
++		text += part;
++	}
++	std::printf("FSR FG: frame end before the flip of %llx (%ux%u), HUD-less copy %s: %s\n",
++	            static_cast<unsigned long long>(address), width, height, copied ? "taken" : "not taken",
++	            text.empty() ? "no draws" : text.c_str());
++	std::fflush(stdout);
++}
++
++void LogError(const char* what, ffxReturnCode_t code) {
++	auto& s = Get();
++	if (s.errors_logged < 40) {
++		s.errors_logged++;
++		std::printf("FSR FG: %s failed (%u)\n", what, static_cast<unsigned>(code));
++		std::fflush(stdout);
++	}
++}
++
++// ---- Frame generation (context_mutex held). ----
++
++// Frame generation is turned off on the swapchain first (that waits for the interpolation and
++// composition work that uses the context), then the context is destroyed.
++void DestroyFrameGenContext() {
++	auto& s = Get();
++	if (s.frame_gen_context != nullptr) {
++		ffxConfigureDescFrameGeneration off {};
++		off.header.type            = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
++		off.swapChain              = reinterpret_cast<void*>(s.swapchain);
++		off.frameGenerationEnabled = false;
++		(void)s.configure(&s.frame_gen_context, &off.header);
++		(void)s.destroy(&s.frame_gen_context, nullptr);
++		s.frame_gen_context = nullptr;
++	}
++}
++
++void EnsureFrameGenContext(uint32_t render_width, uint32_t render_height) {
++	auto& s = Get();
++	if (s.swapchain_context == nullptr || s.frame_gen_failed) {
++		return;
++	}
++	const uint32_t max_width  = std::max(s.display.width, render_width);
++	const uint32_t max_height = std::max(s.display.height, render_height);
++	if (s.frame_gen_context != nullptr && s.frame_gen_desc.maxRenderSize.width >= render_width &&
++	    s.frame_gen_desc.maxRenderSize.height >= render_height) {
++		return;
++	}
++	if (s.frame_gen_context != nullptr) {
++		// A larger render size: nothing of the old context may be in flight.
++		QueueScope                                           queue;
++		ffxDispatchDescFrameGenerationSwapChainWaitForPresentsVK wait {};
++		wait.header.type = FFX_API_DISPATCH_DESC_TYPE_FGSWAPCHAIN_WAIT_FOR_PRESENTS_VK;
++		(void)s.dispatch(&s.swapchain_context, &wait.header);
++		DestroyFrameGenContext();
++	}
++	s.frame_gen_backend                                = {};
++	s.frame_gen_backend.header.type                    = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
++	s.frame_gen_backend.deviceContext.vkDevice         = s.device.device;
++	s.frame_gen_backend.deviceContext.vkPhysicalDevice = s.device.physical_device;
++	s.frame_gen_backend.deviceContext.vkDeviceProcAddr = &DeviceProcAddr;
++	// Since SDK 2.1 the version structure is required (without it the newer API is refused).
++	s.frame_gen_version              = {};
++	s.frame_gen_version.header.type  = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_VERSION;
++	s.frame_gen_version.header.pNext = &s.frame_gen_backend.header;
++	s.frame_gen_version.version      = FFX_FRAMEGENERATION_VERSION;
++	s.frame_gen_desc                 = {};
++	s.frame_gen_desc.header.type     = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
++	s.frame_gen_desc.header.pNext    = &s.frame_gen_version.header;
++	s.frame_gen_desc.flags = FFX_FRAMEGENERATION_ENABLE_ASYNC_WORKLOAD_SUPPORT |
++	                         FFX_FRAMEGENERATION_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION |
++	                         (s.depth_inverted ? FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED : 0u) |
++	                         (s.display_hdr ? FFX_FRAMEGENERATION_ENABLE_HIGH_DYNAMIC_RANGE : 0u) |
++	                         (s.debug ? FFX_FRAMEGENERATION_ENABLE_DEBUG_CHECKING : 0u);
++	s.frame_gen_desc.displaySize      = {s.display.width, s.display.height};
++	s.frame_gen_desc.maxRenderSize    = {max_width, max_height};
++	s.frame_gen_desc.backBufferFormat = ffxApiGetSurfaceFormatVK(s.display_format);
++	const auto result                 = s.create(&s.frame_gen_context, &s.frame_gen_desc.header, nullptr);
++	if (result != FFX_API_RETURN_OK) {
++		s.frame_gen_context = nullptr;
++		s.frame_gen_failed  = true;
++		std::printf("FSR FG: frame generation context creation failed (%u) for display %ux%u, render up to %ux%u: off\n",
++		            static_cast<unsigned>(result), s.display.width, s.display.height, max_width, max_height);
++	} else {
++		s.first_configure = true;
++		std::printf("FSR FG: frame generation context created, display %ux%u (format %d%s), render up to %ux%u, %s\n",
++		            s.display.width, s.display.height, static_cast<int>(s.display_format), s.display_hdr ? ", HDR" : "",
++		            max_width, max_height, s.async ? "async compute queue" : "game queue");
++	}
++	std::fflush(stdout);
++}
++
++// Without inputs for the presented frame the swapchain still shows whatever is in the output:
++// the real frame again.
++void CopyPresentColor(const ffxDispatchDescFrameGeneration& params) {
++	auto&      d      = VULKAN_HPP_DEFAULT_DISPATCHER;
++	const auto cmd    = static_cast<VkCommandBuffer>(params.commandList);
++	const auto source = reinterpret_cast<VkImage>(params.presentColor.resource);
++	const auto target = reinterpret_cast<VkImage>(params.outputs[0].resource);
++	if (cmd == VK_NULL_HANDLE || source == VK_NULL_HANDLE || target == VK_NULL_HANDLE) {
++		return;
++	}
++	Barrier(cmd, source, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++	        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
++	VkImageCopy region {};
++	region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++	region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++	region.extent         = {params.presentColor.description.width, params.presentColor.description.height, 1};
++	d.vkCmdCopyImage(cmd, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
++	Barrier(cmd, source, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++	        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT);
++}
++
++// The swapchain's frame-generation callback: called inside QueuePresent on the present thread,
++// with the command buffer the interpolation is submitted in.
++ffxReturnCode_t FrameGenerationCallback(ffxDispatchDescFrameGeneration* params, void*) {
++	auto&            s = Get();
++	std::scoped_lock lock(s.context_mutex);
++	Skip             skip  = Skip::Count;
++	Slot             frame {};
++	if (s.frame_gen_context == nullptr) {
++		skip = Skip::NoContext;
++	} else if (params->frameID == s.generated_frame) {
++		skip = Skip::Repeat;
++	} else {
++		std::scoped_lock slots(s.slot_mutex);
++		const auto&      slot = s.slots[params->frameID % SLOT_COUNT];
++		if (slot.valid && slot.frame == params->frameID && slot.depth != VK_NULL_HANDLE &&
++		    slot.motion != VK_NULL_HANDLE) {
++			frame = slot;
++		} else {
++			skip = Skip::NoInputs;
++		}
++	}
++	if (skip == Skip::Count) {
++		ffxDispatchDescFrameGenerationPrepareV2 prepare {};
++		std::memcpy(prepare.cameraPosition, frame.camera_position, sizeof(prepare.cameraPosition));
++		std::memcpy(prepare.cameraUp, frame.camera_up, sizeof(prepare.cameraUp));
++		std::memcpy(prepare.cameraRight, frame.camera_right, sizeof(prepare.cameraRight));
++		std::memcpy(prepare.cameraForward, frame.camera_forward, sizeof(prepare.cameraForward));
++		prepare.header.type             = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2;
++		// A gap in the frame IDs (a frame without inputs) resets the generation by itself.
++		prepare.reset                   = false;
++		prepare.frameID                 = params->frameID;
++		prepare.flags                   = s.debug ? FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW : 0u;
++		prepare.commandList             = params->commandList;
++		prepare.renderSize              = {frame.width, frame.height};
++		prepare.jitterOffset            = {frame.jitter[0], frame.jitter[1]};
++		prepare.motionVectorScale       = {-static_cast<float>(frame.width), -static_cast<float>(frame.height)};
++		prepare.frameTimeDelta          = frame.frame_ms;
++		prepare.cameraNear              = frame.camera_near;
++		prepare.cameraFar               = frame.camera_far;
++		prepare.cameraFovAngleVertical  = frame.camera_fov;
++		prepare.viewSpaceToMetersFactor = 1.0f;
++		prepare.depth = Resource(frame.depth, FFX_API_SURFACE_FORMAT_R32_FLOAT, frame.image_width, frame.image_height,
++		                         FFX_API_RESOURCE_USAGE_READ_ONLY, FFX_API_RESOURCE_STATE_COMPUTE_READ);
++		prepare.motionVectors = Resource(frame.motion, ffxApiGetSurfaceFormatVK(frame.motion_format),
++		                                 frame.image_width, frame.image_height, FFX_API_RESOURCE_USAGE_READ_ONLY,
++		                                 FFX_API_RESOURCE_STATE_COMPUTE_READ);
++		if (const auto result = s.dispatch(&s.frame_gen_context, &prepare.header); result != FFX_API_RETURN_OK) {
++			LogError("frame generation prepare", result);
++			skip = Skip::Prepare;
++		} else if (const auto generated = s.dispatch(&s.frame_gen_context, &params->header);
++		           generated != FFX_API_RETURN_OK) {
++			LogError("frame generation dispatch", generated);
++			skip = Skip::Dispatch;
++		}
++	}
++	if (skip != Skip::Count) {
++		s.skips[static_cast<size_t>(skip)]++;
++		CopyPresentColor(*params);
++	} else {
++		s.generated_frame   = params->frameID;
++		s.present_generated = true;
++		s.generated++;
++	}
++	return FFX_API_RETURN_OK;
++}
++
++// What this process has allocated on the video card's own heaps and what the driver lets it have
++// (VK_EXT_memory_budget; zeros without it): a session that slows down as it goes on shows here.
++void VideoMemory(uint64_t& used, uint64_t& budget) {
++	auto& s = Get();
++	VkPhysicalDeviceMemoryBudgetPropertiesEXT budgets {};
++	budgets.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
++	VkPhysicalDeviceMemoryProperties2 properties {};
++	properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
++	properties.pNext = &budgets;
++	VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceMemoryProperties2(s.device.physical_device, &properties);
++	used = budget = 0;
++	for (uint32_t i = 0; i < properties.memoryProperties.memoryHeapCount; i++) {
++		if ((properties.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
++			used += budgets.heapUsage[i];
++			budget += budgets.heapBudget[i];
++		}
++	}
++}
++
++void Summary() {
++	auto&      s   = Get();
++	const auto now = NowNs();
++	if (s.print_ns == 0) {
++		s.print_ns = now;
++		return;
++	}
++	if (now - s.print_ns < 10'000'000'000LL) {
++		return;
++	}
++	s.print_ns = now;
++	std::string text;
++	for (size_t i = 0; i < s.skips.size(); i++) {
++		if (s.skips[i] != 0) {
++			text += " " + std::string(SKIP_NAMES[i]) + "=" + std::to_string(s.skips[i]);
++		}
++	}
++	Slot last {};
++	{
++		std::scoped_lock slots(s.slot_mutex);
++		last = s.slots[s.configured_frame % SLOT_COUNT];
++	}
++	uint64_t video_used = 0, video_budget = 0;
++	VideoMemory(video_used, video_budget);
++	std::printf("FSR FG 10s: %llu game presents, %llu generated (%.2f shown per game frame) | not generated:%s | "
++	            "inputs %llu, %ux%u, jitter %.3f %.3f px, frame %.1f ms, camera near %.3f far %.1f vfov %.1f deg | "
++	            "HUD-less: %llu copies, %llu used, %llu unavailable | video memory %llu of %llu MiB\n",
++	            static_cast<unsigned long long>(s.presents), static_cast<unsigned long long>(s.generated),
++	            s.presents == 0 ? 1.0 : 1.0 + static_cast<double>(s.generated) / static_cast<double>(s.presents),
++	            text.empty() ? " none" : text.c_str(),
++	            static_cast<unsigned long long>(s.tags.exchange(0, std::memory_order_relaxed)), last.width, last.height,
++	            static_cast<double>(last.jitter[0]), static_cast<double>(last.jitter[1]),
++	            static_cast<double>(last.frame_ms), static_cast<double>(last.camera_near),
++	            static_cast<double>(last.camera_far), static_cast<double>(last.camera_fov) * 57.29577951308232,
++	            static_cast<unsigned long long>(s.hud_copies.exchange(0, std::memory_order_relaxed)),
++	            static_cast<unsigned long long>(s.hud_used),
++	            static_cast<unsigned long long>(s.hud_unavailable.exchange(0, std::memory_order_relaxed)),
++	            static_cast<unsigned long long>(video_used >> 20), static_cast<unsigned long long>(video_budget >> 20));
++	std::fflush(stdout);
++	s.hud_used = 0;
++	s.presents = s.generated = 0;
++	s.skips                  = {};
++}
++
++} // namespace
++
++// ---- Device. ----
++
++uint32_t ExtraQueues(uint32_t family_queue_count, uint32_t used) {
++	if (!FrameGenRequested()) {
++		return 0;
++	}
++	if (family_queue_count < used + 3) {
++		std::printf("FSR FG: frame generation needs 3 more queues of the graphics family (it has %u, %u in use): off\n",
++		            family_queue_count, used);
++		std::fflush(stdout);
++		return 0;
++	}
++	return 3;
++}
++
++void OnDeviceReady(const DeviceInfo& info) {
++	auto& s  = Get();
++	s.device = info;
++	if (!FrameGenRequested()) {
++		return;
++	}
++	if (!LoadFfx()) {
++		return;
++	}
++	if (FrameGenRequested()) {
++		if (info.extra_count == 3) {
++			s.frame_gen_active.store(true, std::memory_order_release);
++			std::printf("FSR FG: frame generation on, queues %p (game) %p %p %p of family %u\n",
++			            reinterpret_cast<void*>(info.game_queue), reinterpret_cast<void*>(info.extra_queues[0]),
++			            reinterpret_cast<void*>(info.extra_queues[1]), reinterpret_cast<void*>(info.extra_queues[2]),
++			            info.queue_family);
++		} else {
++			std::printf("FSR FG: frame generation off (no extra queues)\n");
++		}
++		std::fflush(stdout);
++	}
++}
++
++// ---- Frame generation. ----
++
++bool FrameGenActive() {
++	return Get().frame_gen_active.load(std::memory_order_acquire);
++}
++
++void RenderSubmitted(uint64_t frame) {
++	Get().cp_frame.store(frame, std::memory_order_release);
++}
++
++uint64_t CurrentFrame() {
++	return Get().cp_frame.load(std::memory_order_acquire) + 1;
++}
++
++bool CameraWanted() {
++	auto& s = Get();
++	return FrameGenActive() && s.camera_wanted.load(std::memory_order_acquire);
++}
++
++void SetCamera(const float* constants) {
++	auto& s = Get();
++	if (!CameraWanted()) {
++		return;
++	}
++	std::scoped_lock lock(s.camera_mutex);
++	std::memcpy(s.projection.data(), constants, sizeof(s.projection));
++	std::memcpy(s.view.data(), constants + 16, sizeof(s.view));
++	if (!s.camera_valid) {
++		std::printf("FSR FG: camera projection m[5]=%.5f m[10]=%.6f m[14]=%.6f m[11]=%.1f\n",
++		            static_cast<double>(s.projection[5]), static_cast<double>(s.projection[10]),
++		            static_cast<double>(s.projection[14]), static_cast<double>(s.projection[11]));
++		std::fflush(stdout);
++	}
++	s.camera_valid = true;
++	s.camera_wanted.store(false, std::memory_order_release);
++}
++
++bool TagFrame(VkCommandBuffer cmd, const FrameGen::ImageInput& depth, const FrameGen::ImageInput& motion,
++              const float jitter_uv[2], uint32_t width, uint32_t height) {
++	auto& s = Get();
++	if (!FrameGenActive() || cmd == VK_NULL_HANDLE) {
++		return false;
++	}
++	static bool reported = false;
++	if (!DepthSupported(depth.format) || ffxApiGetSurfaceFormatVK(motion.format) == FFX_API_SURFACE_FORMAT_UNKNOWN ||
++	    depth.width != width || depth.height != height || motion.width != width || motion.height != height) {
++		if (!reported) {
++			reported = true;
++			std::printf("FSR FG: inputs not usable: depth format %d %ux%u, motion format %d %ux%u, pass %ux%u\n",
++			            static_cast<int>(depth.format), depth.width, depth.height, static_cast<int>(motion.format),
++			            motion.width, motion.height, width, height);
++			std::fflush(stdout);
++		}
++		return false;
++	}
++	const uint64_t   frame = CurrentFrame();
++	std::scoped_lock lock(s.slot_mutex);
++	auto&            slot = s.slots[frame % SLOT_COUNT];
++	if (slot.valid && slot.frame == frame) {
++		return true; // the first upscale pass of the frame
++	}
++	slot.valid = false;
++	if (!PrepareSlot(slot, width, height, motion.format)) {
++		return false;
++	}
++	CopyDepth(cmd, depth, slot);
++	CopyMotion(cmd, motion, slot);
++	const auto now  = NowNs();
++	slot.frame_ms   = s.tag_ns == 0 ? 16.7f
++	                                : std::clamp(static_cast<float>(static_cast<double>(now - s.tag_ns) / 1e6), 1.0f, 250.0f);
++	s.tag_ns        = now;
++	slot.jitter[0]  = s.jitter_sign * jitter_uv[0] * static_cast<float>(width);
++	slot.jitter[1]  = s.jitter_sign * jitter_uv[1] * static_cast<float>(height);
++	FillCamera(slot);
++	slot.frame = frame;
++	slot.valid = true;
++	if (!reported) {
++		reported = true;
++		std::printf("FSR FG: frame inputs %ux%u, depth format %d, motion format %d\n", width, height,
++		            static_cast<int>(depth.format), static_cast<int>(motion.format));
++		std::fflush(stdout);
++	}
++	s.tags.fetch_add(1, std::memory_order_relaxed);
++	return true;
++}
++
++void PresentStart(uint64_t frame) {
++	auto&            s = Get();
++	std::scoped_lock lock(s.context_mutex);
++	s.present_generated = false;
++	if (s.swapchain_context == nullptr || frame == 0 || frame == s.configured_frame) {
++		return; // a present without a new frame keeps the last configuration
++	}
++	uint32_t render_width = 0, render_height = 0;
++	{
++		std::scoped_lock slots(s.slot_mutex);
++		const auto&      slot = s.slots[frame % SLOT_COUNT];
++		if (slot.valid && slot.frame == frame) {
++			render_width  = slot.width;
++			render_height = slot.height;
++		}
++	}
++	if (render_width != 0) {
++		EnsureFrameGenContext(render_width, render_height);
++	}
++	if (s.frame_gen_context == nullptr) {
++		return;
++	}
++	ffxConfigureDescFrameGeneration config {};
++	config.header.type             = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
++	config.swapChain               = reinterpret_cast<void*>(s.swapchain);
++	config.frameGenerationCallback = &FrameGenerationCallback;
++	config.frameGenerationEnabled  = true;
++	config.allowAsyncWorkloads     = s.async;
++	config.flags = s.debug ? FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW | FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_TEAR_LINES
++	                       : 0u;
++	config.onlyPresentGenerated = false;
++	config.generationRect       = {0, 0, static_cast<int32_t>(s.display.width), static_cast<int32_t>(s.display.height)};
++	config.frameID              = frame;
++	// The presented frame without its HUD (fsr.h), when one was taken for it at this size.
++	const auto hud = std::exchange(s.present_hud, HudImage {});
++	if (hud.image != VK_NULL_HANDLE && hud.width == s.display.width && hud.height == s.display.height &&
++	    hud.format == s.display_format) {
++		config.HUDLessColor = Resource(hud.image, ffxApiGetSurfaceFormatVK(hud.format), hud.width, hud.height,
++		                               FFX_API_RESOURCE_USAGE_READ_ONLY, FFX_API_RESOURCE_STATE_COMPUTE_READ);
++		s.hud_used++;
++	}
++	ffxReturnCode_t result      = FFX_API_RETURN_OK;
++	if (s.first_configure) {
++		// Turning interpolation on waits for the queues to be idle.
++		QueueScope queue;
++		result = s.configure(&s.frame_gen_context, &config.header);
++	} else {
++		result = s.configure(&s.frame_gen_context, &config.header);
++	}
++	if (result != FFX_API_RETURN_OK) {
++		LogError("frame generation configure", result);
++		return;
++	}
++	s.first_configure  = false;
++	s.configured_frame = frame;
++}
++
++void PresentEnd(uint64_t) {
++	auto&            s = Get();
++	std::scoped_lock lock(s.context_mutex);
++	if (s.swapchain_context == nullptr) {
++		return;
++	}
++	s.presents++;
++	const double shown = s.present_generated ? 2.0 : 1.0;
++	const double old   = s.shown_ratio.load(std::memory_order_relaxed);
++	s.shown_ratio.store(old + (shown - old) * 0.1, std::memory_order_relaxed);
++	Summary();
++}
++
++double ShownPerGameFrame() {
++	return FrameGenActive() ? Get().shown_ratio.load(std::memory_order_relaxed) : 1.0;
++}
++
++// ---- Swapchain. ----
++
++bool CreateSwapchain(const VkSwapchainCreateInfoKHR& info, VkSwapchainKHR* swapchain) {
++	auto& s = Get();
++	if (!FrameGenActive() || swapchain == nullptr) {
++		return false;
++	}
++	std::scoped_lock lock(s.context_mutex);
++	if (s.swapchain_context != nullptr) {
++		std::printf("FSR FG: a second swapchain is created normally\n");
++		return false;
++	}
++	const auto queue = [&](VkQueue handle, PFN_vkQueueSubmitFFXAPI submit) {
++		VkQueueInfoFFXAPI q {};
++		q.queue       = handle;
++		q.familyIndex = s.device.queue_family;
++		q.submitFunc  = submit;
++		return q;
++	};
++	VkSwapchainKHR handle              = VK_NULL_HANDLE;
++	s.swapchain_desc                   = {};
++	s.swapchain_desc.header.type       = FFX_API_CREATE_CONTEXT_DESC_TYPE_FGSWAPCHAIN_VK;
++	s.swapchain_desc.physicalDevice    = s.device.physical_device;
++	s.swapchain_desc.device            = s.device.device;
++	s.swapchain_desc.swapchain         = &handle;
++	s.swapchain_desc.allocator         = nullptr;
++	s.swapchain_desc.createInfo        = info;
++	s.swapchain_desc.gameQueue         = queue(s.device.game_queue, &SubmitGameQueue);
++	s.swapchain_desc.asyncComputeQueue = queue(s.device.extra_queues[0], nullptr);
++	s.swapchain_desc.presentQueue      = queue(s.device.extra_queues[1], nullptr);
++	s.swapchain_desc.imageAcquireQueue = queue(s.device.extra_queues[2], nullptr);
++	s.swapchain_version                = {};
++	s.swapchain_version.header.type    = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_VERSION_VK;
++	s.swapchain_version.version        = FFX_FRAMEGENERATION_SWAPCHAIN_VK_VERSION;
++	s.swapchain_desc.header.pNext      = &s.swapchain_version.header;
++	ffxReturnCode_t result             = FFX_API_RETURN_OK;
++	{
++		QueueScope queue_lock;
++		result = s.create(&s.swapchain_context, &s.swapchain_desc.header, nullptr);
++	}
++	s.swapchain_desc.swapchain = nullptr;
++	if (result != FFX_API_RETURN_OK || handle == VK_NULL_HANDLE) {
++		s.swapchain_context = nullptr;
++		std::printf("FSR FG: frame generation swapchain creation failed (%u): normal swapchain\n",
++		            static_cast<unsigned>(result));
++		std::fflush(stdout);
++		return false;
++	}
++	s.functions             = {};
++	s.functions.header.type = FFX_API_QUERY_DESC_TYPE_FGSWAPCHAIN_FUNCTIONS_VK;
++	result                  = s.query(&s.swapchain_context, &s.functions.header);
++	if (result != FFX_API_RETURN_OK || s.functions.pOutGetSwapchainImagesKHR == nullptr ||
++	    s.functions.pOutAcquireNextImageKHR == nullptr || s.functions.pOutQueuePresentKHR == nullptr) {
++		std::printf("FSR FG: swapchain replacement functions unavailable (%u): normal swapchain\n",
++		            static_cast<unsigned>(result));
++		std::fflush(stdout);
++		QueueScope queue_lock;
++		(void)s.destroy(&s.swapchain_context, nullptr);
++		s.swapchain_context = nullptr;
++		return false;
++	}
++	s.swapchain        = handle;
++	s.display          = info.imageExtent;
++	s.display_format   = info.imageFormat;
++	s.display_hdr      = info.imageColorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
++	s.frame_gen_failed = false;
++	s.configured_frame = 0;
++	s.generated_frame  = 0;
++	s.hud_display_width.store(info.imageExtent.width, std::memory_order_relaxed);
++	s.hud_display_height.store(info.imageExtent.height, std::memory_order_relaxed);
++	s.hud_display_format.store(static_cast<uint32_t>(info.imageFormat), std::memory_order_release);
++	*swapchain         = handle;
++	std::printf("FSR FG: frame generation swapchain %ux%u, format %d, %u images, present mode %d\n", info.imageExtent.width,
++	            info.imageExtent.height, static_cast<int>(info.imageFormat), info.minImageCount,
++	            static_cast<int>(info.presentMode));
++	std::fflush(stdout);
++	return true;
++}
++
++bool OwnsSwapchain(VkSwapchainKHR swapchain) {
++	auto& s = Get();
++	return swapchain != VK_NULL_HANDLE && s.swapchain == swapchain;
++}
++
++void DestroySwapchain(VkSwapchainKHR swapchain) {
++	auto&            s = Get();
++	std::scoped_lock lock(s.context_mutex);
++	if (s.swapchain_context == nullptr || s.swapchain != swapchain) {
++		return;
++	}
++	QueueScope queue_lock;
++	ffxDispatchDescFrameGenerationSwapChainWaitForPresentsVK wait {};
++	wait.header.type = FFX_API_DISPATCH_DESC_TYPE_FGSWAPCHAIN_WAIT_FOR_PRESENTS_VK;
++	(void)s.dispatch(&s.swapchain_context, &wait.header);
++	DestroyFrameGenContext();
++	(void)s.destroy(&s.swapchain_context, nullptr);
++	s.swapchain_context = nullptr;
++	// SDK 2.x: the swapchain handle outlives its context and is destroyed through the replacement
++	// function afterwards (its context argument is unused).
++	if (s.functions.pOutDestroySwapchainFFXAPI != nullptr) {
++		s.functions.pOutDestroySwapchainFFXAPI(s.device.device, swapchain, nullptr, nullptr);
++	}
++	s.functions         = {};
++	s.swapchain         = VK_NULL_HANDLE;
++	s.configured_frame  = 0;
++	s.generated_frame   = 0;
++	s.present_hud       = {};
++	s.hud_display_format.store(0, std::memory_order_release);
++}
++
++// ---- HUD-less colour. ----
++
++uint64_t NoteDisplayFrame(uint64_t address, VkFormat frame_format, uint32_t width, uint32_t height) {
++	auto& s = Get();
++	if (!s.hud_enabled || !FrameGenActive() || address == 0) {
++		return 0;
++	}
++	if (std::find(s.hud_addresses.begin(), s.hud_addresses.end(), address) == s.hud_addresses.end()) {
++		s.hud_addresses[s.hud_address_next++ % s.hud_addresses.size()] = address;
++	}
++	s.hud_frame_format   = frame_format;
++	s.hud_frame_width    = width;
++	s.hud_frame_height   = height;
++	const uint64_t token = s.hud_captured != 0 && s.hud_captured_address == address ? s.hud_captured : 0;
++	LogFrameTail(address, width, height, token != 0);
++	s.hud_captured       = 0;
++	s.hud_opaque_address = 0;
++	s.hud_tried          = false;
++	s.hud_run_total      = 0;
++	return token;
++}
++
++bool DisplayAddress(uint64_t address) {
++	const auto& s = Get();
++	return address != 0 && std::find(s.hud_addresses.begin(), s.hud_addresses.end(), address) != s.hud_addresses.end();
++}
++
++bool HudlessDraw(uint64_t address, uint32_t width, uint32_t height, bool blended) {
++	auto& s = Get();
++	if (!s.hud_enabled || !FrameGenActive()) {
++		return false;
++	}
++	const bool display = std::find(s.hud_addresses.begin(), s.hud_addresses.end(), address) != s.hud_addresses.end();
++	HudRun*    run     = s.hud_run_total != 0 ? &s.hud_runs[(s.hud_run_total - 1) % HUD_RUNS] : nullptr;
++	if (run == nullptr || run->address != address) {
++		run          = &s.hud_runs[s.hud_run_total++ % HUD_RUNS];
++		*run         = {};
++		run->address = address;
++		run->width   = width;
++		run->height  = height;
++		run->display = display;
++	}
++	(blended ? run->blended : run->opaque)++;
++	if (!display || s.hud_tried) {
++		return false;
++	}
++	if (!blended) {
++		s.hud_opaque_address = address;
++		return false;
++	}
++	if (s.hud_opaque_address != address) {
++		return false;
++	}
++	// The first blended draw over the picture the last full-screen pass left: the HUD starts.
++	s.hud_tried = true;
++	run->copy   = true;
++	return true;
++}
++
++void HudlessUnavailable() {
++	Get().hud_unavailable.fetch_add(1, std::memory_order_relaxed);
++}
++
++void CaptureHudless(VkCommandBuffer cmd, VkImage source, VkFormat format, uint32_t width, uint32_t height,
++                    VkImageLayout layout, VkAccessFlags access, uint64_t address) {
++	auto&          s              = Get();
++	auto&          d              = VULKAN_HPP_DEFAULT_DISPATCHER;
++	const uint32_t display_width  = s.hud_display_width.load(std::memory_order_relaxed);
++	const uint32_t display_height = s.hud_display_height.load(std::memory_order_relaxed);
++	const auto     display_format = static_cast<VkFormat>(s.hud_display_format.load(std::memory_order_acquire));
++	if (cmd == VK_NULL_HANDLE || source == VK_NULL_HANDLE || display_format == VK_FORMAT_UNDEFINED ||
++	    display_width == 0 || display_height == 0 || s.hud_frame_format == VK_FORMAT_UNDEFINED ||
++	    width != s.hud_frame_width || height != s.hud_frame_height || layout == VK_IMAGE_LAYOUT_UNDEFINED) {
++		HudlessUnavailable();
++		return;
++	}
++	// The presenter copies the display buffer into a frame of its own format (no conversion) and
++	// scales that into the swapchain image: the same two steps, the first one only when the
++	// formats differ, give the same pixels wherever the HUD does not draw.
++	const bool direct = format == s.hud_frame_format;
++	if (!direct && !EnsureHudImage(s.hud_source, s.hud_frame_format, width, height)) {
++		HudlessUnavailable();
++		return;
++	}
++	HudImage target;
++	uint32_t index = 0;
++	{
++		std::scoped_lock lock(s.hud_mutex);
++		index      = s.hud_next;
++		s.hud_next = (s.hud_next + 1) % HUD_COUNT;
++		auto& slot = s.hud_ring[index];
++		slot.serial = 0;
++		if (!EnsureHudImage(slot, display_format, display_width, display_height)) {
++			HudlessUnavailable();
++			return;
++		}
++		target = slot;
++	}
++	Barrier(cmd, source, VK_IMAGE_ASPECT_COLOR_BIT, layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, access,
++	        VK_ACCESS_TRANSFER_READ_BIT);
++	VkImage from = source;
++	if (!direct) {
++		Barrier(cmd, s.hud_source.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
++		        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
++		VkImageCopy copy {};
++		copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++		copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++		copy.extent         = {width, height, 1};
++		d.vkCmdCopyImage(cmd, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s.hud_source.image,
++		                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
++		Barrier(cmd, s.hud_source.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++		        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
++		from = s.hud_source.image;
++	}
++	Barrier(cmd, target.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
++	        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
++	VkImageBlit blit {};
++	blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++	blit.srcOffsets[1]  = {static_cast<int32_t>(width), static_cast<int32_t>(height), 1};
++	blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++	blit.dstOffsets[1]  = {static_cast<int32_t>(display_width), static_cast<int32_t>(display_height), 1};
++	d.vkCmdBlitImage(cmd, from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++	                 1, &blit, VK_FILTER_LINEAR);
++	Barrier(cmd, target.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++	        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
++	Barrier(cmd, source, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, layout,
++	        VK_ACCESS_TRANSFER_READ_BIT, access);
++	{
++		std::scoped_lock lock(s.hud_mutex);
++		auto&            slot = s.hud_ring[index];
++		slot.serial           = ++s.hud_serial;
++		slot.address          = address;
++		s.hud_captured        = slot.serial;
++		s.hud_captured_address = address;
++	}
++	s.hud_copies.fetch_add(1, std::memory_order_relaxed);
++}
++
++void SetPresentHudless(uint64_t token) {
++	auto&    s = Get();
++	HudImage found {};
++	if (token != 0) {
++		std::scoped_lock lock(s.hud_mutex);
++		for (const auto& slot: s.hud_ring) {
++			if (slot.serial == token) {
++				found = slot;
++			}
++		}
++	}
++	s.present_hud = found;
++}
++
++VkResult GetSwapchainImages(VkSwapchainKHR swapchain, uint32_t* count, VkImage* images) {
++	auto& s = Get();
++	return s.functions.pOutGetSwapchainImagesKHR(s.device.device, swapchain, count, images);
++}
++
++VkResult AcquireNextImage(VkSwapchainKHR swapchain, uint64_t timeout, VkSemaphore semaphore, VkFence fence,
++                          uint32_t* index) {
++	auto& s = Get();
++	return s.functions.pOutAcquireNextImageKHR(s.device.device, swapchain, timeout, semaphore, fence, index);
++}
++
++VkResult QueuePresent(VkQueue queue, const VkPresentInfoKHR* present) {
++	return Get().functions.pOutQueuePresentKHR(queue, present);
++}
++
++#endif
++
++} // namespace Libs::Graphics::Fsr
+diff --git a/src/graphics/host_gpu/renderer/fsr.h b/src/graphics/host_gpu/renderer/fsr.h
+new file mode 100644
+index 0000000..91fa2dd
+--- /dev/null
++++ b/src/graphics/host_gpu/renderer/fsr.h
+@@ -0,0 +1,111 @@
++#ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_FSR_H_
++#define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_FSR_H_
++
++#include "graphics/host_gpu/renderer/frameGen.h"
++
++#include <cstdint>
++
++#include <vulkan/vulkan_core.h>
++
++// AMD FSR frame generation (FSR Frame Generation 3.1.6 with its frame-interpolation swapchain 3.1.7;
++// FSR 4 versions where the runtime offers them for the card) through the AMD FSR SDK 2.4 API. The
++// SDK's signed Vulkan runtime is loaded at run time from ASTROHYBRID_FSR_PATH, else from the folder of
++// this module: amd_fidelityfx_loader_vk.dll (also used by FSR upscaling, fsr.inc) and
++// amd_fidelityfx_framegeneration_vk.dll next to it. Needs a build with KYTY_FFX_SDK_DIR; works on any
++// Vulkan GPU with three spare queues in its graphics family.
++//
++// ASTROHYBRID_FSRFG=1 (default 0; off with ASTROHYBRID_DLSSG=1): FSR frame generation, one generated
++// frame per rendered frame.
++//  - Three more queues of the graphics family are created (FSR's swapchain needs its own queues for
++//    async compute, composition/present and image acquisition).
++//  - Kyty's swapchain is created through FSR's frame-interpolation swapchain: acquire and present
++//    go through its replacement functions, and the presented image is left in
++//    SHADER_READ_ONLY_OPTIMAL (what that swapchain expects) instead of PRESENT_SRC.
++//  - The frame hooks are DLSS-G's (frameGen.h forwards them here when this is requested): the
++//    camera from the game's per-view constants, and at the game's temporal upscale pass the depth
++//    and motion vectors, which are copied into a small ring of images owned by this module (the
++//    game's are valid only at that point; the depth copy is R32F, so any D32 format works). The
++//    game renders at a dynamic resolution: the copies keep the largest size seen and FSR is told
++//    the part in use.
++//  - Everything FSR does for frame generation is recorded on the present thread, in the
++//    swapchain's frame-generation callback: "prepare" with the copies of the presented frame, then
++//    the interpolation. A frame without inputs (loading screens, menus drawn without the upscale
++//    pass, a repeated present) shows the real frame twice.
++//  - VK_NV_low_latency2 and DLSS-G stay off with it (the swapchain is FSR's). The game's own
++//    upscaling, DLSS Super Resolution (ASTROHYBRID_DLSS) and FSR upscaling (ASTROHYBRID_FSR, dlss.h)
++//    all work with it.
++//  Options: ASTROHYBRID_FSRFG_ASYNC=0 runs the interpolation on the game queue instead of the
++//  async compute queue; ASTROHYBRID_FSRFG_DEBUG=1 draws FSR's debug view and tear lines;
++//  ASTROHYBRID_FSRFG_HUD=0 turns the HUD-less copy below off; ASTROHYBRID_FSR_DEPTH_INVERTED=1|0
++//  (default: ASTROHYBRID_DLSS_DEPTH_INVERTED, else 0) and ASTROHYBRID_DLSS_JITTER_SIGN as for DLSS.
++//  One "FSR FG 10s:" console line every 10 s (ending with the video memory in use).
++//
++// Fsr::Requested() (dlss.h) is FSR upscaling; the functions here are frame generation only.
++namespace Libs::Graphics::Fsr {
++
++[[nodiscard]] bool FrameGenRequested();
++
++// Device creation: how many more queues of the graphics family to create (0 or 3), given how many
++// the family has and how many are already taken.
++[[nodiscard]] uint32_t ExtraQueues(uint32_t family_queue_count, uint32_t used);
++// Locks the game queue for one submission from another thread (GraphicContext::queue_mutex).
++using QueueLock = void (*)(bool lock);
++struct DeviceInfo {
++	VkPhysicalDevice physical_device = VK_NULL_HANDLE;
++	VkDevice         device          = VK_NULL_HANDLE;
++	uint32_t         queue_family    = 0;
++	VkQueue          game_queue      = VK_NULL_HANDLE;
++	VkQueue          extra_queues[3] = {};
++	uint32_t         extra_count     = 0;
++	QueueLock        queue_lock      = nullptr;
++};
++void OnDeviceReady(const DeviceInfo& info);
++
++// Frame generation (frameGen.h forwards these when FrameGenRequested()).
++[[nodiscard]] bool FrameGenActive();
++void RenderSubmitted(uint64_t frame);
++[[nodiscard]] uint64_t CurrentFrame();
++void PresentStart(uint64_t frame);
++void PresentEnd(uint64_t frame);
++[[nodiscard]] double ShownPerGameFrame();
++[[nodiscard]] bool CameraWanted();
++void SetCamera(const float* constants);
++bool TagFrame(VkCommandBuffer cmd, const FrameGen::ImageInput& depth, const FrameGen::ImageInput& motion,
++              const float jitter_uv[2], uint32_t width, uint32_t height);
++
++// HUD-less colour for frame generation (ASTROHYBRID_FSRFG_HUD=0 turns it off). Without it the
++// game's HUD is interpolated with the picture and smears when the camera moves. The game draws the
++// HUD into the display buffer after its last full-screen pass: before the first blended draw that
++// follows an unblended one there, the display buffer is scaled into an image of the swapchain's
++// size and format exactly as the present does it later. FSR interpolates that image and takes
++// every pixel in which the presented frame differs from it (the HUD) from the real frame.
++//
++// A flip (PrepareFrame, in command order): the guest address of the display buffer, the format of
++// the presenter's frame and the buffer's size. Returns the token of the HUD-less copy taken from
++// this buffer since the previous flip (0: none), which travels with the presenter's frame.
++[[nodiscard]] uint64_t NoteDisplayFrame(uint64_t address, VkFormat frame_format, uint32_t width, uint32_t height);
++// Whether a guest address is that of a display buffer flipped lately (render thread).
++[[nodiscard]] bool DisplayAddress(uint64_t address);
++// Every draw before it is prepared (render thread): its first colour target and whether it blends.
++// True: the HUD-less copy is to be taken now (CaptureHudless).
++[[nodiscard]] bool HudlessDraw(uint64_t address, uint32_t width, uint32_t height, bool blended);
++// The display buffer `source` (outside rendering, in `layout` with `access`, both restored).
++void CaptureHudless(VkCommandBuffer cmd, VkImage source, VkFormat format, uint32_t width, uint32_t height,
++                    VkImageLayout layout, VkAccessFlags access, uint64_t address);
++// The copy could not be taken (the display buffer's image is not usable as it is).
++void HudlessUnavailable();
++// Present thread, while the present's commands are recorded: the token of the frame it shows.
++void SetPresentHudless(uint64_t token);
++
++// Swapchain (presentation/window/swapchain.cpp). CreateSwapchain: false leaves the normal path.
++[[nodiscard]] bool CreateSwapchain(const VkSwapchainCreateInfoKHR& info, VkSwapchainKHR* swapchain);
++[[nodiscard]] bool OwnsSwapchain(VkSwapchainKHR swapchain);
++void DestroySwapchain(VkSwapchainKHR swapchain);
++VkResult GetSwapchainImages(VkSwapchainKHR swapchain, uint32_t* count, VkImage* images);
++VkResult AcquireNextImage(VkSwapchainKHR swapchain, uint64_t timeout, VkSemaphore semaphore, VkFence fence,
++                          uint32_t* index);
++VkResult QueuePresent(VkQueue queue, const VkPresentInfoKHR* present);
++
++} // namespace Libs::Graphics::Fsr
++
++#endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_FSR_H_
+diff --git a/src/graphics/host_gpu/renderer/render.h b/src/graphics/host_gpu/renderer/render.h
+index 2f71bbb..1f07c0e 100644
+--- a/src/graphics/host_gpu/renderer/render.h
++++ b/src/graphics/host_gpu/renderer/render.h
+@@ -1193,6 +1193,10 @@ private:
+ 	// depth, motion vectors and constants at the temporal upscale pass.
+ 	void NoteFrameGenCamera(const PreparedBindings& stage);
+ 	void TagFrameGen(CommandBuffer& buffer, PreparedBindings& pixel);
++	// ASTROHYBRID_FSRFG (fsr.h): the HUD-less copy of the display buffer, taken before the draw
++	// that starts the HUD is prepared; and the cache image of a display buffer a draw targets.
++	void NoteHudlessDraw(CommandBuffer& buffer);
++	void NoteHudlessTarget(const RenderColorInfo& color);
+ 	void                      ResetBindings();
+ 	// `site` names the caller's stage and table kind; it only selects the entry checked first.
+ 	// *fresh (optional): set when the returned range was allocated by this call (no earlier upload
+diff --git a/src/graphics/host_gpu/renderer/renderDraw.cpp b/src/graphics/host_gpu/renderer/renderDraw.cpp
+index 046c085..60a2853 100644
+--- a/src/graphics/host_gpu/renderer/renderDraw.cpp
++++ b/src/graphics/host_gpu/renderer/renderDraw.cpp
+@@ -26,6 +26,7 @@
+ #include "graphics/host_gpu/renderer/drawPrep/bindingPlan.h"
+ #include "graphics/host_gpu/renderer/dlss.h"
+ #include "graphics/host_gpu/renderer/frameGen.h"
++#include "graphics/host_gpu/renderer/fsr.h"
+ #include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
+ #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
+ #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
+@@ -4169,6 +4170,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
+ 	if (Dlss::Requested() || FrameGen::Requested() || Fsr::Requested()) [[unlikely]] {
+ 		NoteDlssTargets(std::span<const RenderColorInfo> {state.color_info, state.color_count},
+ 		                state.depth_info.image_id);
++		// ASTROHYBRID_FSRFG (fsr.h): the display buffers' cache images, for the HUD-less copy.
++		if (state.color_count != 0 && Fsr::FrameGenActive()) {
++			NoteHudlessTarget(state.color_info[0]);
++		}
+ 		if (FrameGen::Active() && state.ps_active && bindings.pixel.has_value()) {
+ 			NoteFrameGenCamera(*bindings.pixel);
+ 			TagFrameGen(buffer, *bindings.pixel);
+@@ -4892,6 +4897,9 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
+ 	if (!DrawHasValidVertexShader(sh_ctx)) {
+ 		return;
+ 	}
++	if (Fsr::FrameGenActive()) [[unlikely]] {
++		NoteHudlessDraw(buffer);
++	}
+ 
+ 	if (graphics_debug_dump_enabled()) {
+ 		LOGF("GraphicsRenderDrawIndex():Shader:\n");
+@@ -5045,6 +5053,9 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
+ 	if (!DrawHasValidVertexShader(sh_ctx)) {
+ 		return;
+ 	}
++	if (Fsr::FrameGenActive()) [[unlikely]] {
++		NoteHudlessDraw(buffer);
++	}
+ 
+ 	if (graphics_debug_dump_enabled()) {
+ 		LOGF("GraphicsRenderDrawIndexAuto():Shader:\n");
+@@ -5271,6 +5282,9 @@ bool RenderExecutor::DrawIndirectNative(uint64_t submit_id, CommandBuffer& buffe
+ 	if (!DrawHasValidVertexShader(sh_ctx)) {
+ 		return true;
+ 	}
++	if (Fsr::FrameGenActive()) [[unlikely]] {
++		NoteHudlessDraw(buffer);
++	}
+ 
+ 	if (graphics_debug_dump_enabled()) {
+ 		LOGF("GraphicsRenderDrawIndirectNative():Shader:\n");
+diff --git a/src/graphics/host_gpu/vma.cpp b/src/graphics/host_gpu/vma.cpp
+index d4004bb..2e8b448 100644
+--- a/src/graphics/host_gpu/vma.cpp
++++ b/src/graphics/host_gpu/vma.cpp
+@@ -20,6 +20,7 @@
+ #include "common/logging/log.h"
+ #include "common/profiler.h"
+ #include "graphics/host_gpu/graphicContext.h"
++#include "graphics/host_gpu/renderer/fsr.h"
+ #include "graphics/host_gpu/vramBudget.h"
+ #include "graphics/host_gpu/vramStats.h"
+ 
+@@ -831,7 +832,15 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
+ 		budget = std::min(budget, cap);
+ 	}
+ 	if (discrete) {
+-		return budget - std::min<uint64_t>(budget / 8, 1024ull * 1024 * 1024);
++		uint64_t reserve = std::min<uint64_t>(budget / 8, 1024ull * 1024 * 1024);
++		// ASTROHYBRID_FSRFG (renderer/fsr.h): FSR's frame generation context and swapchain, the
++		// copies of depth and motion vectors, and DLSS's own memory are allocated outside the
++		// caches that plan with this budget. As much again is left for them, so that the image
++		// cache does not fill the card to the point where the driver moves memory off it.
++		if (Fsr::FrameGenRequested()) {
++			reserve += std::min<uint64_t>(budget / 8, 1024ull * 1024 * 1024);
++		}
++		return budget - reserve;
+ 	}
+ 	constexpr uint64_t system_reserve = 8ull * 1024 * 1024 * 1024;
+ 	const auto         available      = budget > usage ? budget - usage : uint64_t {0};
+diff --git a/src/graphics/presentation/window/lowLatency.cpp b/src/graphics/presentation/window/lowLatency.cpp
+index 5ff926c..eacd64f 100644
+--- a/src/graphics/presentation/window/lowLatency.cpp
++++ b/src/graphics/presentation/window/lowLatency.cpp
+@@ -205,7 +205,8 @@ bool WantExtensions(bool has_low_latency2, bool has_present_id) {
+ 		return false;
+ 	}
+ 	if (FrameGen::Requested()) {
+-		std::printf("LowLatency: DLSS-G takes over the markers through Streamline's Reflex\n");
++		std::printf("LowLatency: frame generation takes over the frame markers (DLSS-G: Streamline's Reflex; "
++		            "FSR: none)\n");
+ 		return false;
+ 	}
+ 	if (!has_low_latency2 || !has_present_id) {
+diff --git a/src/graphics/presentation/window/swapchain.cpp b/src/graphics/presentation/window/swapchain.cpp
+index caa9055..901a390 100644
+--- a/src/graphics/presentation/window/swapchain.cpp
++++ b/src/graphics/presentation/window/swapchain.cpp
+@@ -9,6 +9,7 @@
+ #include "gpu_blit_shaders/gpu_video_out_downscale_spv.h"
+ #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
+ #include "graphics/host_gpu/graphicContext.h"
++#include "graphics/host_gpu/renderer/fsr.h"
+ #include "graphics/host_gpu/renderer/render.h"
+ #include "graphics/host_gpu/renderer/renderContext.h"
+ #include "graphics/host_gpu/vulkanCommon.h"
+@@ -40,6 +41,8 @@ struct Presenter::Frame {
+ 	VulkanImage   image;
+ 	vk::ImageView view         = nullptr;
+ 	uint64_t      present_tick = 0;
++	// ASTROHYBRID_FSRFG (renderer/fsr.h): the token of this frame's HUD-less copy (0: none).
++	uint64_t      hudless      = 0;
+ 	bool          busy         = false;
+ 	bool          hdr          = false;
+ 	bool          blank        = false;
+@@ -526,14 +529,25 @@ void Swapchain::Create() {
+ 	}
+ 	create_info.clipped = VK_TRUE;
+ 	create_info.pNext   = LowLatency::SwapchainCreateNext(create_info.pNext);
+-	RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
+-	                     "vkCreateSwapchainKHR");
++	// ASTROHYBRID_FSRFG (renderer/fsr.h): FSR's frame-interpolation swapchain in place of the
++	// driver's; its images, acquire and present go through Fsr:: from here on.
++	if (VkSwapchainKHR fsr_swapchain = VK_NULL_HANDLE;
++	    Fsr::CreateSwapchain(static_cast<const VkSwapchainCreateInfoKHR&>(create_info), &fsr_swapchain)) {
++		m_handle = vk::SwapchainKHR(fsr_swapchain);
++	} else {
++		RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
++		                     "vkCreateSwapchainKHR");
++	}
+ 	EXIT_IF(m_handle == nullptr);
+ 	LowLatency::OnSwapchainCreated(static_cast<VkSwapchainKHR>(m_handle));
+ 	LOGF("Vulkan presentation: %s\n", m_hdr_active ? "HDR10 (PQ)" : "SDR");
+ 
+ 	m_images = EnumerateVulkan<vk::Image>(
+ 	    "vkGetSwapchainImagesKHR", [&](uint32_t* count, vk::Image* images) {
++		    if (Fsr::OwnsSwapchain(static_cast<VkSwapchainKHR>(m_handle))) {
++			    return static_cast<vk::Result>(Fsr::GetSwapchainImages(
++			        static_cast<VkSwapchainKHR>(m_handle), count, reinterpret_cast<VkImage*>(images)));
++		    }
+ 		    return graphics.device.getSwapchainImagesKHR(m_handle, count, images);
+ 	    });
+ 	EXIT_NOT_IMPLEMENTED(m_images.empty());
+@@ -626,7 +640,11 @@ void Swapchain::Destroy() {
+ 	}
+ 	if (m_handle != nullptr) {
+ 		LowLatency::OnSwapchainDestroyed(static_cast<VkSwapchainKHR>(m_handle));
+-		graphics.device.destroySwapchainKHR(m_handle, nullptr);
++		if (Fsr::OwnsSwapchain(static_cast<VkSwapchainKHR>(m_handle))) {
++			Fsr::DestroySwapchain(static_cast<VkSwapchainKHR>(m_handle));
++		} else {
++			graphics.device.destroySwapchainKHR(m_handle, nullptr);
++		}
+ 	}
+ 
+ 	m_handle        = nullptr;
+@@ -712,9 +730,14 @@ Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler) {
+ 		m_frame_ticks[m_frame_index] = 0;
+ 	}
+ 	m_image_index     = static_cast<uint32_t>(-1);
+-	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
+-	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
+-	    &m_image_index);
++	const auto result =
++	    Fsr::OwnsSwapchain(static_cast<VkSwapchainKHR>(m_handle))
++	        ? static_cast<vk::Result>(Fsr::AcquireNextImage(
++	              static_cast<VkSwapchainKHR>(m_handle), std::numeric_limits<uint64_t>::max(),
++	              static_cast<VkSemaphore>(m_image_acquired[m_frame_index]), VK_NULL_HANDLE, &m_image_index))
++	        : m_window.graphic_ctx.device.acquireNextImageKHR(
++	              m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
++	              &m_image_index);
+ 	switch (result) {
+ 		case vk::Result::eSuccess: break;
+ 		case vk::Result::eSuboptimalKHR:
+@@ -1054,6 +1077,11 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame*
+ 	                      : vk::Extent2D {};
+ 	const bool filtered = source != nullptr && PresentBoxDownscaleEnabled() &&
+ 	                      PresentNeedsFilter(source_extent, m_extent);
++	// ASTROHYBRID_FSRFG (renderer/fsr.h): the HUD-less copy of this frame was scaled with the blit
++	// below, so it is used with that blit only.
++	if (Fsr::OwnsSwapchain(static_cast<VkSwapchainKHR>(m_handle))) {
++		Fsr::SetPresentHudless(source != nullptr && !filtered ? source->hudless : 0);
++	}
+ 	if (filtered) {
+ 		if (source->view == nullptr) {
+ 			vk::ImageViewCreateInfo view {};
+@@ -1125,16 +1153,21 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame*
+ 		                           &black, 1, &to_transfer.subresourceRange);
+ 	}
+ 
++	// ASTROHYBRID_FSRFG (renderer/fsr.h): FSR's swapchain takes its images in the shader-read
++	// layout (it copies or composes them into the driver's swapchain image itself).
++	const bool fsr_swapchain  = Fsr::OwnsSwapchain(static_cast<VkSwapchainKHR>(m_handle));
++	const auto present_layout = fsr_swapchain ? vk::ImageLayout::eShaderReadOnlyOptimal : vk::ImageLayout::ePresentSrcKHR;
++	const auto present_access = fsr_swapchain ? vk::AccessFlagBits::eShaderRead : vk::AccessFlagBits::eMemoryRead;
+ 	vk::ImageMemoryBarrier to_present {};
+ 	to_present.sType               = vk::StructureType::eImageMemoryBarrier;
+ 	to_present.srcAccessMask =
+ 	    filtered ? vk::AccessFlagBits::eColorAttachmentWrite : vk::AccessFlagBits::eTransferWrite;
+ 	to_present.dstAccessMask       = draw_attachment ? vk::AccessFlagBits::eColorAttachmentRead |
+ 	                                                       vk::AccessFlagBits::eColorAttachmentWrite
+-	                                                 : vk::AccessFlagBits::eMemoryRead;
++	                                                 : vk::AccessFlags {present_access};
+ 	to_present.oldLayout           = to_transfer.newLayout;
+ 	to_present.newLayout           = draw_attachment ? vk::ImageLayout::eColorAttachmentOptimal
+-	                                                 : vk::ImageLayout::ePresentSrcKHR;
++	                                                 : present_layout;
+ 	to_present.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+ 	to_present.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+ 	to_present.image               = m_images[m_image_index];
+@@ -1164,9 +1197,9 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame*
+ 			m_system_overlay->Record(vk_command, m_image_views[m_image_index]);
+ 		}
+ 		to_present.srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite;
+-		to_present.dstAccessMask = vk::AccessFlagBits::eMemoryRead;
++		to_present.dstAccessMask = present_access;
+ 		to_present.oldLayout     = vk::ImageLayout::eColorAttachmentOptimal;
+-		to_present.newLayout     = vk::ImageLayout::ePresentSrcKHR;
++		to_present.newLayout     = present_layout;
+ 		vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
+ 		                           vk::PipelineStageFlagBits::eAllCommands,
+ 		                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1,
+@@ -1200,7 +1233,8 @@ Swapchain::Status Swapchain::Present() {
+ 	present.pWaitSemaphores    = &ready;
+ 	present.waitSemaphoreCount = 1;
+ 
+-	vk::Result result;
++	vk::Result result     = vk::Result::eSuccess;
++	const bool fsr_present = Fsr::OwnsSwapchain(static_cast<VkSwapchainKHR>(m_handle));
+ 	// ASTROHYBRID_LOW_LATENCY (lowLatency.h): the presented flip's frame number as present ID.
+ 	const auto            latency_id = LowLatency::BeginPresent(static_cast<VkSwapchainKHR>(m_handle));
+ 	vk::PresentIdKHR      present_id {};
+@@ -1214,7 +1248,15 @@ Swapchain::Status Swapchain::Present() {
+ 		// texture copies: the present never waits for them, nor for a signal not yet submitted.
+ 		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
+ 		m_window.graphic_ctx.submission_queue.DrainReadyForPresentLocked();
+-		result = m_window.graphic_ctx.queue.presentKHR(&present);
++		if (!fsr_present) {
++			result = m_window.graphic_ctx.queue.presentKHR(&present);
++		}
++	}
++	if (fsr_present) {
++		// FSR's present submits to the game queue through Fsr's own lock of queue_mutex, and
++		// waits for its next image without holding it.
++		result = static_cast<vk::Result>(Fsr::QueuePresent(static_cast<VkQueue>(m_window.graphic_ctx.queue),
++		                                                   &static_cast<const VkPresentInfoKHR&>(present)));
+ 	}
+ 	LowLatency::EndPresent(static_cast<VkSwapchainKHR>(m_handle), latency_id);
+ 	switch (result) {
+@@ -1278,6 +1320,9 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
+ 	}
+ 	frame->Configure(m_impl->window.graphic_ctx,
+ 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
++	frame->hudless = headset ? 0
++	                         : Fsr::NoteDisplayFrame(image.info.data.address, static_cast<VkFormat>(frame_format),
++	                                                 image.backing.extent.width, image.backing.extent.height);
+ 	frame->CopyFrom(buffer, image);
+ 	if (headset) {
+ 		// The frame holds the raw display-encoded pixels the headset needs.
+@@ -1293,8 +1338,9 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height,
+ 	KYTY_PROFILER_FUNCTION();
+ 	auto              format = m_impl->frames.GetFormat();
+ 	auto*             frame  = m_impl->frames.Acquire({width, height}, format);
+-	frame->hdr   = false;
+-	frame->blank = true;
++	frame->hdr     = false;
++	frame->blank   = true;
++	frame->hudless = 0;
+ 	// Into the GPU thread's command buffer (its flip) under the renderer's lock; the present
+ 	// thread's blank frame (no producer) uses only the presenter's scheduler and frame.
+ 	std::optional<RenderLockGuard> render_lock;
+diff --git a/src/graphics/presentation/window/vulkanWindow.cpp b/src/graphics/presentation/window/vulkanWindow.cpp
+index b204619..4594723 100644
+--- a/src/graphics/presentation/window/vulkanWindow.cpp
++++ b/src/graphics/presentation/window/vulkanWindow.cpp
+@@ -34,6 +34,7 @@
+ #include "graphics/presentation/window/lowLatency.h"
+ #include "graphics/host_gpu/renderer/dlss.h"
+ #include "graphics/host_gpu/renderer/frameGen.h"
++#include "graphics/host_gpu/renderer/fsr.h"
+ #include "graphics/presentation/window/windowInternal.h"
+ #include "graphics/shader/recompiler/CodegenOptions.h"
+ #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+@@ -692,6 +693,13 @@ static void PrintGpuCapabilities(GraphicContext& graphics, const vk::PhysicalDev
+ 	            automatic ? "on (NVIDIA Turing)" : "off");
+ }
+ 
++// ASTROHYBRID_FSRFG (renderer/fsr.h): the queues of the graphics family created for FSR's
++// swapchain (after the game queue and the side queue), and the context whose queue_mutex guards
++// the game queue.
++static uint32_t        g_fsr_first_queue = 0;
++static uint32_t        g_fsr_queue_count = 0;
++static GraphicContext* g_fsr_graphics    = nullptr;
++
+ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
+ 	                                 const std::vector<const char*>& device_extensions) {
+ 	const auto physical_device = graphics.physical_device;
+@@ -722,12 +730,15 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
+ 	       graphics.side_queue_index != 0 ? "queue 1" : "shared with queue 0", queue_family,
+ 	       family_queue_count);
+ 
+-	const std::array<float, 2> queue_priorities {1.0f, 1.0f};
++	const std::array<float, 8> queue_priorities {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+ 	std::array<vk::DeviceQueueCreateInfo, 2> queue_create_infos {};
+ 	auto&                      queue_create_info = queue_create_infos[0];
+ 	queue_create_info.queueFamilyIndex = queue_family;
+ 	queue_create_info.queueCount       = graphics.side_queue_index != 0 ? 2u : 1u;
+ 	queue_create_info.pQueuePriorities = queue_priorities.data();
++	g_fsr_first_queue = queue_create_info.queueCount;
++	g_fsr_queue_count = Fsr::ExtraQueues(family_queue_count, queue_create_info.queueCount);
++	queue_create_info.queueCount += g_fsr_queue_count;
+ 	// KYTY_UPLOAD_DMA: one queue of a transfer-only family (the copy engines), for UploadDma.
+ 	// Not under RenderDoc, whose captures of the extra queue are not needed for analysis.
+ 	graphics.transfer_queue_family = static_cast<uint32_t>(-1);
+@@ -2287,6 +2298,29 @@ void WindowContext::CreateVulkan() {
+ 		                            &graphic_ctx.transfer_queue);
+ 		EXIT_IF(graphic_ctx.transfer_queue == nullptr);
+ 	}
++	// ASTROHYBRID_FSRFG (renderer/fsr.h): the device and the queues for FSR frame generation.
++	{
++		g_fsr_graphics = &graphic_ctx;
++		Fsr::DeviceInfo fsr {};
++		fsr.physical_device = static_cast<VkPhysicalDevice>(graphic_ctx.physical_device);
++		fsr.device          = static_cast<VkDevice>(graphic_ctx.device);
++		fsr.queue_family    = graphic_ctx.queue_family;
++		fsr.game_queue      = static_cast<VkQueue>(graphic_ctx.queue);
++		for (uint32_t i = 0; i < g_fsr_queue_count && i < 3; i++) {
++			vk::Queue queue = nullptr;
++			graphic_ctx.device.getQueue(graphic_ctx.queue_family, g_fsr_first_queue + i, &queue);
++			fsr.extra_queues[i] = static_cast<VkQueue>(queue);
++			fsr.extra_count     = i + 1;
++		}
++		fsr.queue_lock = [](bool lock) {
++			if (lock) {
++				g_fsr_graphics->queue_mutex.Lock();
++			} else {
++				g_fsr_graphics->queue_mutex.Unlock();
++			}
++		};
++		Fsr::OnDeviceReady(fsr);
++	}
+ 	if (graphic_ctx.gpu_breadcrumbs_requested) {
+ 		GpuBreadcrumbs::Initialize(graphic_ctx, graphic_ctx.device_coherent_memory_enabled);
+ 	}
+-- 
+2.54.0.windows.1
+

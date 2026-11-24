@@ -6,7 +6,7 @@
         xmlns:local="clr-namespace:AstroHybrid.App.Views"
         xmlns:vm="clr-namespace:AstroHybrid.App.ViewModels"
         mc:Ignorable="d"
-        Title="AstroHybrid Setup" Height="760" Width="720" MinHeight="560" MinWidth="620"
+        Title="AstroHybrid Setup" Height="640" Width="700" MinHeight="380" MinWidth="500"
         WindowStartupLocation="CenterScreen"
         ResizeMode="CanResize"
         Style="{StaticResource MainWindowStyle}"
@@ -18,7 +18,8 @@
     </Window.Resources>
 
 
-    <Grid Margin="40">
+    <Border Background="{StaticResource WindowSpaceBrush}" Padding="32">
+    <Grid>
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
@@ -26,9 +27,11 @@
         </Grid.RowDefinitions>
 
         <!-- Header -->
-        <StackPanel Grid.Row="0" Margin="0,0,0,30">
-            <TextBlock Text="AstroHybrid" Style="{StaticResource TitleTextStyle}"/>
-            <TextBlock Text="Astro Bot Native PC Port Setup" Style="{StaticResource SubtitleTextStyle}"/>
+        <StackPanel Grid.Row="0" Margin="0,0,0,22">
+            <TextBlock FontSize="28" FontWeight="ExtraBold">
+                <Run Text="ASTRO" Foreground="White"/><Run Text="HYBRID" Foreground="#FF38BDF8"/>
+            </TextBlock>
+            <TextBlock Text="Astro Bot Native PC Port Setup" Style="{StaticResource SubtitleTextStyle}" FontSize="15"/>
         </StackPanel>
 
         <!-- Content -->
@@ -155,4 +158,5 @@
                     Visibility="Collapsed"/>
         </StackPanel>
     </Grid>
+    </Border>
 </Window>

@@ -1,157 +1,85 @@
-# Astro Bot native PC port (AstroHybrid): DLSS Frame Generation, Reflex, any controller
+# Astro Bot — Native PC Port (AstroHybrid)
 
+<a href="https://recomplauncher.com/game/pcportastrobot"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
 
+A native PC port of **Astro Bot** (PPSA21567, v01.019.000) for **Windows** and **Linux**, with **60+ FPS** support, **NVIDIA DLSS Super Resolution & (Multi) Frame Generation**, **AMD FSR Upscaling & Frame Generation**, **NVIDIA Reflex**, **Ultrawide (21:9 / 32:9)**, **Stability Mode**, **RecompLauncher** integration, and full controller support.
 
-A personal research project: running my own legally owned PS5 copy of **Astro Bot** (PPSA21567, v01.019.000)
-natively on Windows, with NVIDIA DLSS Super Resolution, DLSS (Multi) Frame Generation and Reflex added on top.
+**No game files are in this repository or in the download**, and none will be: no game executable, assets, shaders, keys, saves, or game artwork. You need your own legally owned decrypted dump of the game; the setup converts it locally on your PC.
 
-**No game files are in this repository or in the download**, and none will be: no game executable, assets,
-shaders, keys, saves or game artwork. You need your own decrypted dump of the game; the setup converts it on your PC.
+## How It Works
 
-## Download and play
+This is **not an emulator** — it is a native PC port:
 
-1. Download the **AstroBotPC-AstroHybrid** zip from the [latest release](https://github.com/imnotsharingmyname/pcportastrobot/releases/latest)
-   and extract it anywhere with about 1 GB free (the game itself stays where your dump is).
-2. Start **AstroHybrid.exe**. Setup asks for your Astro Bot dump folder (Browse, or paste the path and press Check folder, then Install) (the one with `eboot.bin`, `sce_module`,
-   `sce_sys`) and builds the Windows version of the game from it in about two minutes. Your dump is only read.
-3. The app picks the best settings for your PC once (graphics card, CPU, RAM, display); change anything on the
-   Graphics, Controller and Advanced pages.
-4. Press **Play**.
+- **AnyPS5:** Relinks the game's original x86-64 code directly into a native PC executable (`AstroBot.exe`), with PS5 system libraries (kernel, libc, audio, controller input, save data, etc.) implemented natively.
+- **Vulkan Graphics Translation:** Translates the game's native PS5 graphics command buffers and shaders directly to **Vulkan**, with **NVIDIA DLSS**, **AMD FSR**, **Frame Generation**, and **NVIDIA Reflex** integrated on top.
 
-The download is the same build as the development PC: the same PS5 system libraries, `kyty_gpu.dll` (DLSS,
-frame generation, Reflex, controller fixes), the same launcher settings, and setup makes the same `AstroBot.exe`
-byte for byte from a 01.019.000 dump. Other Astro Bot versions are accepted: the faster-lighting patch and
-real-time game speed switch themselves off when that version's code differs (they depend on exact code
-locations); everything else works the same way. Only 01.019.000 has been tested.
+## Download and Play
 
-Requirements: Windows 10/11 x64, a Vulkan GPU; DLSS needs an RTX card, frame generation an RTX 40 or 50.
-Controllers: DualSense, DualShock 4, Xbox, Switch Pro and compatible pads, generic pads (the one you press plays).
-Command line: `AstroHybrid.exe --setup "<dump folder>"` runs the setup without a window; `--remove-game` removes
-what setup built.
+1. Download the **AstroBotPC-AstroHybrid** zip from the [latest release](https://github.com/imnotsharingmyname/pcportastrobot/releases/latest) and extract it anywhere with ~1 GB free (your game dump stays where it is).
+2. Run **AstroHybrid.exe**. Select your Astro Bot dump folder (`eboot.bin`, `sce_module`, `sce_sys`) or ZArchive (`app0.zar`) and click **Install** — setup builds the Windows version locally in about two minutes without modifying your dump.
+3. On first launch, the app automatically detects your CPU, GPU, RAM, and display and applies the best settings for your PC. You can customize anything on the **Graphics**, **Controller**, and **Advanced** pages.
+4. Click **Play**.
 
-### ZArchive (`app0.zar`) dumps
+Other Astro Bot versions are accepted (only v01.019.000 has been fully tested).  
+Command line: `AstroHybrid.exe --setup "<dump folder>"` runs setup headless; `--remove-game` removes what setup built.
 
-Setup accepts `app0.zar` alongside loose `eboot.bin`, `sce_module` and `sce_sys`; no empty `data` folder is needed.
-Archive entries must be relative to the dump root (`data/...`, **not** `app0/data/...`). The archive is installed
-beside `Build\RunHybrid\app0`. The additional runtime patches provide read-only archive stdio and exact-first
-`.odx` to `.odxb` filename fallback; an older release needs rebuilt runtime libraries, not just Repair.
-See [the ZAR layout, build and troubleshooting guide](Docs/ZAR.md). Full game verification on Windows is still required.
+## What You Need for 60 FPS
 
-### Screenshots
+### 60+ FPS with Frame Generation (Recommended)
+- **OS:** Windows 10 / 11 (64-bit) or Linux
+- **CPU:** 6-core / 12-thread modern processor (e.g., Ryzen 5 5600 / Core i5-12400 or better)
+- **GPU:** NVIDIA RTX 40/50-series (DLSS Frame Generation) or Vulkan 1.3 GPU (AMD FSR Frame Generation), 8 GB+ VRAM
+- **RAM:** 16–32 GB
 
+### 60 FPS Native (without Frame Generation)
+- **OS:** Windows 10 / 11 (64-bit) or Linux
+- **CPU:** 8-core / 16-thread high single-thread processor (e.g., Ryzen 7 7700X / 7800X3D or Core i7-13700K+)
+- **GPU:** Vulkan 1.3 GPU, RTX 4060 Ti / 5060 or equivalent AMD GPU (with DLSS / FSR Quality or Balanced for 1440p)
+- **RAM:** 32 GB recommended
+
+### Minimum (30 FPS)
+- **OS:** Windows 10 / 11 (64-bit) or Linux
+- **CPU:** 6-core / 12-thread modern processor
+- **GPU:** Vulkan 1.3 capable GPU (8 GB VRAM recommended)
+- **RAM:** 16 GB
+
+**Controllers:** DualSense (HD haptics, controller speaker, light bar, adaptive triggers, motion sensors), DualShock 4, Xbox, Switch Pro and compatible pads, and generic pads (whichever pad you press becomes Player 1).
+
+## Screenshots
+
+### Gameplay
+![Sky Garden Gameplay](docs/screenshots/gameplay-skygarden.png)
+
+### Launcher
 | Home | Graphics |
 |---|---|
 | ![Home page](docs/screenshots/app-home.png) | ![Graphics page](docs/screenshots/app-graphics.png) |
 | **Controller** | **Advanced** |
 | ![Controller page](docs/screenshots/app-controller.png) | ![Advanced page](docs/screenshots/app-advanced.png) |
 
-## What it is
+## Features & Progress
 
-This is **not an emulator**. It is a native port:
+- **Upscaling & Frame Generation (NVIDIA & AMD):**
+  - **NVIDIA DLSS Super Resolution** (Quality / Balanced / Performance / DLAA) on any RTX GPU, **DLSS Frame Generation (2x)** on RTX 40-series+, **Multi Frame Generation (3x / 4x)** on RTX 50-series, **Adaptive Frame Generation**, and **NVIDIA Reflex**.
+  - **AMD FSR** upscaling (FSR 4 / 3.1 / 2) and **FSR Frame Generation** for AMD, Intel, and non-RTX GPUs.
+- **60+ FPS & Real-Time Game Speed:** Full real-time game speed at any frame rate (no slow motion below 60 FPS), with stable cloth and physics simulation.
+- **Pre-Launch Shader Prep & Stability:** Smooth shader preparation before gameplay, VSync default, and stability guards.
+- **Windows & Native Linux Support:** Full Windows launcher (`AstroHybrid.exe`) with built-in auto-updater and **RecompLauncher** integration, plus native Linux support.
+- **Ultrawide Display Support:** Native 21:9 and 32:9 ultrawide render-space support.
+- **ZArchive (`app0.zar`) & Mods Support:** Supports both standard decrypted dumps and ZArchive (`app0.zar`) dumps, plus a dedicated `mods` folder.
+- **Built-in Performance Overlay:** Shows both on-screen FPS and native game FPS (`F2`), plus `F11` / `Alt+Enter` fullscreen toggle.
+- **Laptop / Hybrid GPU Support:** Automatically detects discrete GPUs on Optimus / dual-GPU laptops and lets you pick your Vulkan adapter in Graphics settings.
+- **Full Controller Support:**
+  - **DualSense:** HD haptics, controller speaker, adaptive triggers (adjustable strength), light bar, and gyro/accelerometer motion.
+  - **DualShock 4, Xbox, Switch Pro & Generic Pads:** Full support with customizable vibration strength, Switch gyro calibration, and right-stick tilt/motion controls.
 
-- **AnyPS5** relinks the game's own x86-64 code into a Windows `.exe` (`AstroBot.exe`). The PS5 system
-  libraries (kernel, libc, pad, audio, save data and so on) are reimplemented natively as Windows modules.
-- **AstroHybrid**: the PS5 GPU side (AGC command buffers, shaders, VideoOut) is handled by a GPU stack taken from
-  KytyPS5 and built as `kyty_gpu.dll`. It translates the GPU work to Vulkan and is loaded by the native exe.
-- **NVIDIA RTX layer** (new): the game's own temporal upscale pass is found at run time and its inputs (colour,
-  depth, motion vectors, jitter, camera matrices) are handed to DLSS and to DLSS Frame Generation through
-  NVIDIA Streamline 2.14.16 on Vulkan.
+## Notes on Upscaling & Frame Generation
 
-## Benchmarks (real measurements, one PC)
-
-Ryzen 5 5500 (6 cores / 12 threads), RTX 5060 8 GB, 32 GB RAM, 2560x1440 165 Hz, NVIDIA driver 621.
-
-| What | Result |
-|---|---|
-| Sky Garden (heaviest area found), game's own frame rate | **32-34 FPS** uncapped; a 30 FPS cap holds in every 10 s window |
-| Other levels (start positions) | Hoover beach 51-53, snowy canyon 43-44, Cymbal party land 37-39 FPS |
-| Frame Generation 2x (window focused) | exactly 2.00 frames shown per game frame, about **63 FPS on screen** |
-| Multi Frame Generation 4x | exactly 4.00 per game frame, about **124-128 FPS on screen** |
-| Adaptive Frame Generation (target 60) | game held at 24 FPS: switches itself to 3x = 72 on screen; game at 30: 2x = 60 |
-| "Faster CPU path" (commit epoch fast path) | about 0.3 us less per continued draw, roughly **1 ms of command-processor time per frame**; verify mode: 0 mismatches |
-| Real-time game speed | the game ran at 0.50x speed when capped at 30 FPS; now **0.98x** real time |
-| DLSS Super Resolution | runs every frame on the game's 1920x1080 -> 2432x1368 upscale pass, picture correct |
-
-Where the time goes: a 30 ms frame is about 22 ms of draw commit on one CPU thread (about 4,900 draws a frame),
-so the game is **CPU-limited**; the GPU has headroom. That is why Frame Generation is the main smoothing tool
-here, and why lowering the resolution does not raise the frame rate.
-
-Tried and rejected (measured): AVX2 build of the GPU DLL (no difference), write-fault window and lock-spin
-tuning (within noise), Lossless Scaling x2 (stutter and input lag), AnyPS5's own renderer instead of Kyty's
-(does not boot). Every result, good or bad, is in `Docs/OVERNIGHT.md`.
-
-Caveat: numbers move with background load. With a browser playing audio the same 30 FPS-capped scene read
-22-25 FPS in one evening session, so compare runs on a quiet machine.
-
-## What's new in this update
-
-- **DLSS Super Resolution** (`ASTROHYBRID_DLSS=1`). Needed a fix in AnyPS5's libc: CUDA (which DLSS uses) needs
-  a 48 GiB address window below 1 TiB, which the PS5 memory map had taken (`ASTROHYBRID_CUDA_HOLE=1`).
-- **DLSS Frame Generation and Multi Frame Generation** through Streamline (`ASTROHYBRID_DLSSG=1`,
-  2x / 3x / 4x), with an **adaptive mode** that picks the multiplier in game every half second to stay at or
-  above a target on screen (`ASTROHYBRID_DLSSG_TARGET`). The game itself is never capped below 30 FPS.
-- **NVIDIA Reflex** for Vulkan through `VK_NV_low_latency2` (`ASTROHYBRID_LOW_LATENCY=1`).
-- **Cloth and bubble stability** (`KYTY_BUFFER_RANGE_FIXES=1`, `ASTROHYBRID_COMMIT_EPOCH_FASTPATH=0`, plus 60 Hz cloth physics step cap during real-time speed below 60 FPS; issues #30, #35).
-- **Performance overlay** shows frames on screen and the game's own rate with Frame Generation.
-- **Controllers**: DualSense (rumble, light bar, adaptive triggers, motion), Xbox, Switch Pro and compatible
-  pads, generic pads. The pad you press becomes player 1 (before, a second pad got no input), vibration
-  strength for non-DualSense pads, a stronger-rumble option for third-party Switch-style pads.
-- **Launcher** (`AstroBot Launcher.exe`, source in `Tools/hybrid/launcher`):
-  - new NVIDIA RTX section: upscaling, frame generation (Off / Auto / 2x / 3x / 4x), on-screen target, Reflex;
-  - new Controls section: controller choice and vibration strength;
-  - **"Best settings for this PC"**: reads the graphics card, CPU, RAM and display and fills in everything,
-    also on first start. RTX 50: DLSS + Frame Generation Auto (x2-x4) to 120 on a 120 Hz+ display;
-    RTX 40: Auto to 60 (x2); RTX 20/30: DLSS + Reflex at a steady 30; others: the game's own upscaling at 30;
-  - real-time game speed and the faster CPU path are always on (their checkboxes are gone).
-
-All new behaviour is behind environment switches that are off by default; the launcher turns them on.
-
-### Two graphics cards (laptops)
-
-A laptop with Intel or AMD integrated graphics plus an NVIDIA card (Optimus / hybrid) used to show only the
-integrated chip, so the RTX section stayed off. Both launchers now list every adapter, not only the one that
-drives the screen:
-
-- **Graphics page → Display → Graphics card**: "Automatic - best graphics card" (default) or a named card.
-  DLSS, Frame Generation and Reflex follow the card you pick; picking a non-RTX chip turns them off.
-- The renderer itself already prefers a discrete card, so Automatic is right for almost everyone. Pick the
-  integrated chip only to compare performance.
-- "Best settings for this PC" in the classic launcher now reads the discrete card on these laptops too.
-
-## Requirements for the NVIDIA features
-
-- DLSS Super Resolution and Reflex: any RTX card. Frame Generation: RTX 40 or newer; 3x and 4x: RTX 50.
-- The Streamline SDK 2.14.16 and the DLSS runtime, downloaded by you from NVIDIA; the runtime files go next to
-  the game (`ASTROHYBRID_DLSS_PATH`). They are not in this repository.
-- Frame Generation runs only while the game window is focused. Do not combine it with NVIDIA Smooth Motion.
-- Only whole multipliers: NVIDIA's dynamic (fractional) multiplier is D3D12-only.
-
-## Known issues
-
-- Xbox and other pads without motion sensors: the motion hand does not work yet (tilt emulation with
-  View/Back + right stick reaches the pad library but the game did not react in the user's test).
-- Vibration on third-party Switch Pro pads (for example Data Frog) is not confirmed yet.
-- With **no FPS limit and Frame Generation off**, the first loading screen stays black for about 35 s (it
-  runs at about 144 FPS and slows the loading threads); capped starts take about 20 s. It is not a hang.
-- Input latency with Frame Generation has not been measured. The DLSS jitter sign is set by eye.
-- The game is CPU-limited at about 30-34 FPS on a Ryzen 5 5500 in the heaviest areas.
-
-## What is here
-
-| Folder | Contents |
-|---|---|
-| `Source/anyps5` | Canonical AnyPS5 patch series, including native libraries, AstroHybrid host, controller fixes, CUDA address window and ZAR compatibility (`Source/patches` is historical) |
-| `Source/hybrid/patches` | KytyPS5 patch series for `kyty_gpu.dll` (frame pacing, real-time speed, fast path, Reflex, DLSS, Frame Generation, overlay, controllers) |
-| `Source/game-patches` | Small optional byte patches applied at load time (lighting mode, GI probes, fixed 1080p) |
-| `Source/experiments` | Measured experiments that were not kept, with their patches |
-| `Tools/hybrid` | Launcher, run-folder builder, Kyty build script, reverse-engineering helpers |
-| `Tests` | Benchmarks and A/B test scripts |
-| `Docs` | Build instructions, technical plans, reverse-engineering notes, and the full results log (`OVERNIGHT.md`) |
-| `Run-AstroHybrid*.bat` | Start scripts: plain, DLSS, Frame Generation |
-| `AstroHybrid.App` | The AstroHybrid app (WPF, .NET Framework 4.8): setup from a dump (`Services/GameSetup.cs`, a C# port of AnyPS5's `unwrap_self.py`), settings, best settings for the PC, launch |
-| `Tools/release` | `make_release.ps1` builds the download from a working install (with a guard against game files); `make_icon.ps1` draws the app icon |
+- **NVIDIA DLSS Super Resolution & Reflex:** Any NVIDIA RTX GPU.
+- **NVIDIA DLSS Frame Generation:** RTX 40-series or newer (3x / 4x Multi Frame Generation requires RTX 50-series).
+- **AMD FSR Upscaling & Frame Generation:** Supported across Vulkan 1.3 GPUs (AMD, NVIDIA, Intel).
+- Frame Generation is active while the game window is focused. Do not combine it with NVIDIA Smooth Motion.
 
 ## Status
 
-Work in progress, personal use. Not affiliated with or endorsed by Sony Interactive Entertainment, Team ASOBI
-or NVIDIA. Astro Bot is a trademark of its owners; NVIDIA, DLSS and Reflex are trademarks of NVIDIA.
+Work in progress, personal research project. Not affiliated with or endorsed by Sony Interactive Entertainment, Team ASOBI, NVIDIA, or AMD. Astro Bot is a trademark of its owners; NVIDIA, DLSS, and Reflex are trademarks of NVIDIA; AMD and FidelityFX / FSR are trademarks of AMD.

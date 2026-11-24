@@ -54,7 +54,11 @@ namespace AstroHybrid.App.Services
 
             if (state.IsInstalled)
             {
-                state.InstallSizeBytes = GetDirectorySize(state.InstallPath);
+                // The walk below enumerates every file in the install (the game exes and the
+                // hard-linked module copies) and can take seconds on a slow disk; keep it off the
+                // caller's thread. GetInstallationStateAsync's other awaits complete synchronously,
+                // so without this the whole method blocks the UI during startup.
+                state.InstallSizeBytes = await Task.Run(() => GetDirectorySize(state.InstallPath));
                 if (state.Manifest == null)
                 {
                     var exePath = Path.Combine(installPath, "AstroBot.exe");
@@ -257,9 +261,39 @@ namespace AstroHybrid.App.Services
             {
                 settings.FirstRunComplete = true;
                 _settingsManager.Save(settings);
+                TryCreateDesktopLauncherShortcut(_rootDirectory);
             }
 
             return success;
+        }
+
+        public static void TryCreateDesktopLauncherShortcut(string rootDirectory)
+        {
+            try
+            {
+                var exePath = Path.Combine(rootDirectory, "AstroHybrid.exe");
+                if (!File.Exists(exePath)) return;
+                var desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+                if (string.IsNullOrEmpty(desktop) || !Directory.Exists(desktop)) return;
+                var lnkPath = Path.Combine(desktop, "AstroHybrid.lnk");
+                var script = $"$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{lnkPath.Replace("'", "''")}');" +
+                             $"$s.TargetPath='{exePath.Replace("'", "''")}';" +
+                             $"$s.WorkingDirectory='{rootDirectory.Replace("'", "''")}';" +
+                             $"$s.IconLocation='{exePath.Replace("'", "''")}';" +
+                             "$s.Description='AstroHybrid - Astro Bot PC Port Launcher';$s.Save()";
+                var psi = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = "powershell.exe",
+                    Arguments = $"-NoProfile -WindowStyle Hidden -Command \"{script}\"",
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                System.Diagnostics.Process.Start(psi)?.WaitForExit(5000);
+            }
+            catch
+            {
+                // Best-effort shortcut creation; never fail installation if Desktop is restricted.
+            }
         }
 
         // Release installs rerun the setup on the saved dump (it rebuilds the game files and app0 only and
@@ -375,7 +409,12 @@ namespace AstroHybrid.App.Services
         {
             try
             {
-                var (titleId, version) = GameSetup.ReadParam(Path.Combine(_rootDirectory, "Build", "RunHybrid", "app0"));
+                var runHybrid = Path.Combine(_rootDirectory, "Build", "RunHybrid");
+                // sce_sys read through APS5_PATH_ALIASES (#135): its parent is the dump.
+                var root = GameSetup.ReadApp0Aliases(runHybrid).TryGetValue("sce_sys", out var sceSys)
+                    ? Path.GetDirectoryName(sceSys) ?? Path.Combine(runHybrid, "app0")
+                    : Path.Combine(runHybrid, "app0");
+                var (titleId, version) = GameSetup.ReadParam(root);
                 return (string.IsNullOrEmpty(titleId) ? null! : titleId, string.IsNullOrEmpty(version) ? null! : version);
             }
             catch

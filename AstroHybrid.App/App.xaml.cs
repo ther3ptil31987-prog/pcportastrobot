@@ -42,6 +42,14 @@ namespace AstroHybrid.App
                 RunSetupWithoutWindow(e.Args[1]);
                 return;
             }
+            // AstroHybrid.exe --play: starts the game with the saved settings, without a window, and stays
+            // until it exits (exit code = the game's), so RecompLauncher can track play time and back up saves.
+            if (e.Args.Length == 1 && e.Args[0] == "--play")
+            {
+                ShutdownMode = ShutdownMode.OnExplicitShutdown;
+                RunGameWithoutWindow();
+                return;
+            }
             // AstroHybrid.exe --remove-game: removes what the setup built (Installation page, Uninstall).
             if (e.Args.Length == 1 && e.Args[0] == "--remove-game")
             {
@@ -124,7 +132,17 @@ namespace AstroHybrid.App
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(log)!);
                 var progress = new Progress<(int Percent, string Message)>(p =>
-                    File.AppendAllText(log, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {p.Percent,3}% {p.Message}\r\n"));
+                {
+                    File.AppendAllText(log, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {p.Percent,3}% {p.Message}\r\n");
+                    // "progress 0.40 Text" lines for RecompLauncher's setup screen; nowhere to go otherwise.
+                    try
+                    {
+                        Console.Out.WriteLine(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                            "progress {0:0.00} {1}", Math.Max(0, Math.Min(100, p.Percent)) / 100.0, p.Message));
+                        Console.Out.Flush();
+                    }
+                    catch { }
+                });
                 var features = await new GameSetup(root).RunAsync(dump, progress);
                 InitializeSettings();
                 _settings.FirstRunComplete = true;
@@ -138,6 +156,34 @@ namespace AstroHybrid.App
             catch (Exception ex)
             {
                 File.AppendAllText(log, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] FAILED: {ex}\r\n");
+                Shutdown(2);
+            }
+        }
+
+        private async void RunGameWithoutWindow()
+        {
+            try
+            {
+                InitializeSettings();
+                // The saved settings, including choices RecompLauncher wrote, as they are: a later start of the
+                // main window must not replace them with its first-run recommendations.
+                _settings.ApplyBestOnStart = false;
+                // Honor RecompLauncher's Big Picture mode (couch / Steam Deck / controller-only): start fullscreen.
+                var rlMode = Environment.GetEnvironmentVariable("RECOMPLAUNCHER_MODE");
+                if (string.Equals(rlMode, "bigpicture", StringComparison.OrdinalIgnoreCase))
+                {
+                    _settings.Fullscreen = true;
+                }
+                var hardware = new HardwareDetector().DetectHardware();
+                hardware.SelectGpu(_settings.Gpu);
+                _settings.Sanitize(hardware.SupportsDlss, hardware.SupportsFrameGeneration, hardware.SupportsReflex,
+                                   hardware.MaxFrameGenMultiplier);
+                int exitCode = await new LauncherService(GetRootDirectory()).LaunchGameAsync(_settings, hardware);
+                Shutdown(exitCode);
+            }
+            catch (Exception ex)
+            {
+                LogException(ex);
                 Shutdown(2);
             }
         }
@@ -223,6 +269,8 @@ namespace AstroHybrid.App
                 File.AppendAllText(logPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {ex}\n\n");
             }
             catch { }
+            // Also in the debug log, the file people attach to their reports (#137 had only that one).
+            LogDebug($"ERROR (details also in astrohybrid-error.log): {ex}");
         }
     }
 }

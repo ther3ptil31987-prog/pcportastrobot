@@ -1,0 +1,169 @@
+From da2ed41b4a83e5df4607c949645c8bf1d1488e2e Mon Sep 17 00:00:00 2001
+From: Codex <local@invalid>
+Date: Sat, 21 Nov 2026 16:37:20 +0000
+Subject: [PATCH] fix(upscale): one DLSS feature per output size, released only
+ after the GPU is done
+
+DLSS released and recreated its feature at every change of the input size (the game's dynamic
+resolution) or the output size (two sizes around level changes), while the command buffer being
+recorded could still hold an evaluation of the old feature. The GPU then wrote through freed memory
+(device fault: WriteInvalid at 0x0, exit 321, #175). Each output size now has its own feature (up to
+four, the least recently used one replaced), created for inputs up to the output size; the game's
+dynamic resolution moves the input inside it through InRenderSubrectDimensions. A replaced feature is
+released by a deferred operation after the current command buffer completes, and the reset flag is
+tracked per feature.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/graphics/host_gpu/renderer/dlss.cpp | 99 +++++++++++++++++++------
+ 1 file changed, 77 insertions(+), 22 deletions(-)
+
+diff --git a/src/graphics/host_gpu/renderer/dlss.cpp b/src/graphics/host_gpu/renderer/dlss.cpp
+index 703be396..78fa8ca4 100644
+--- a/src/graphics/host_gpu/renderer/dlss.cpp
++++ b/src/graphics/host_gpu/renderer/dlss.cpp
+@@ -221,7 +221,18 @@ struct State {
+ 	bool     ready      = false;
+ #if KYTY_NGX
+ 	NVSDK_NGX_Parameter* params = nullptr;
+-	NVSDK_NGX_Handle*    feature = nullptr;
++	// One DLSS feature per output size (TryDlssUpscale).
++	struct Slot {
++		NVSDK_NGX_Handle* feature    = nullptr;
++		uint32_t          in_w       = 0;
++		uint32_t          in_h       = 0;
++		uint32_t          out_w      = 0;
++		uint32_t          out_h      = 0;
++		uint32_t          last_frame = 0;
++		uint64_t          last_use   = 0;
++	};
++	std::array<Slot, 4> slots {};
++	uint64_t            use_counter = 0;
+ #endif
+ 	uint32_t feature_in_w = 0, feature_in_h = 0, feature_out_w = 0, feature_out_h = 0;
+ 	uint32_t last_frame = 0;
+@@ -527,15 +538,53 @@ bool RenderExecutor::TryDlssUpscale(CommandBuffer& buffer, PreparedBindings& pix
+ 	// Native recording: outside rendering, the recorder drained (CommandBuffer::Handle).
+ 	buffer.EndRendering();
+ 	const auto cmd = buffer.Handle();
+-	if (s.feature == nullptr || s.feature_in_w != in_w || s.feature_in_h != in_h ||
+-	    s.feature_out_w != out_w || s.feature_out_h != out_h) {
+-		if (s.feature != nullptr) {
+-			NVSDK_NGX_VULKAN_ReleaseFeature(s.feature);
+-			s.feature = nullptr;
++	// One feature per output size, created for inputs up to that size: the game's dynamic resolution
++	// moves the input within it (InRenderSubrectDimensions below), and the pass runs at two output
++	// sizes around level changes. Releasing the feature at every input or output change while this
++	// command buffer still held its evaluation made the GPU write through freed memory (device lost,
++	// exit 321, #175); a replaced feature is now released only after this command buffer completes.
++	const auto retire = [&](State::Slot& old) {
++		if (old.feature != nullptr) {
++			NVSDK_NGX_Handle* old_feature = old.feature;
++			m_context.GetCommandScheduler().DeferOperation([old_feature]() {
++				NVSDK_NGX_VULKAN_ReleaseFeature(old_feature);
++			});
++		}
++		old = State::Slot {};
++	};
++	State::Slot* slot = nullptr;
++	for (auto& candidate: s.slots) {
++		if (candidate.feature != nullptr && candidate.out_w == out_w && candidate.out_h == out_h) {
++			slot = &candidate;
++			break;
++		}
++	}
++	if (slot != nullptr && (in_w > slot->in_w || in_h > slot->in_h)) {
++		retire(*slot);
++	}
++	if (slot == nullptr) {
++		for (auto& candidate: s.slots) {
++			if (candidate.feature == nullptr) {
++				slot = &candidate;
++				break;
++			}
++		}
++		if (slot == nullptr) {
++			slot = &s.slots[0];
++			for (auto& candidate: s.slots) {
++				if (candidate.last_use < slot->last_use) {
++					slot = &candidate;
++				}
++			}
++			retire(*slot);
+ 		}
++	}
++	if (slot->feature == nullptr) {
++		const uint32_t max_w = std::max(in_w, out_w);
++		const uint32_t max_h = std::max(in_h, out_h);
+ 		NVSDK_NGX_DLSS_Create_Params create {};
+-		create.Feature.InWidth        = in_w;
+-		create.Feature.InHeight       = in_h;
++		create.Feature.InWidth        = max_w;
++		create.Feature.InHeight       = max_h;
+ 		create.Feature.InTargetWidth  = out_w;
+ 		create.Feature.InTargetHeight = out_h;
+ 		create.Feature.InPerfQualityValue =
+@@ -548,27 +597,33 @@ bool RenderExecutor::TryDlssUpscale(CommandBuffer& buffer, PreparedBindings& pix
+ 		                              NVSDK_NGX_DLSS_Feature_Flags_MVJittered |
+ 		                              NVSDK_NGX_DLSS_Feature_Flags_AutoExposure |
+ 		                              (s.depth_inverted ? NVSDK_NGX_DLSS_Feature_Flags_DepthInverted : 0);
++		NVSDK_NGX_Handle* created = nullptr;
+ 		const auto result = NGX_VULKAN_CREATE_DLSS_EXT(static_cast<VkCommandBuffer>(cmd), 1, 1,
+-		                                               &s.feature, s.params, &create);
++		                                               &created, s.params, &create);
+ 		buffer.ForgetBoundState();
+-		if (NVSDK_NGX_FAILED(result) || s.feature == nullptr) {
++		if (NVSDK_NGX_FAILED(result) || created == nullptr) {
+ 			std::printf("DLSS: feature creation failed (0x%08x) for %ux%u -> %ux%u\n",
+-			            static_cast<unsigned>(result), in_w, in_h, out_w, out_h);
++			            static_cast<unsigned>(result), max_w, max_h, out_w, out_h);
+ 			std::fflush(stdout);
+-			s.ready   = false;
+-			s.feature = nullptr;
++			s.ready = false;
+ 			return Fail(s, Fallback::CreateFailed);
+ 		}
+-		s.feature_in_w  = in_w;
+-		s.feature_in_h  = in_h;
+-		s.feature_out_w = out_w;
+-		s.feature_out_h = out_h;
+-		std::printf("DLSS: Super Resolution feature created, %ux%u -> %ux%u, preset family %d, "
++		slot->feature = created;
++		slot->in_w    = max_w;
++		slot->in_h    = max_h;
++		slot->out_w   = out_w;
++		slot->out_h   = out_h;
++		std::printf("DLSS: Super Resolution feature created, up to %ux%u -> %ux%u, preset family %d, "
+ 		            "depth inverted %d, jitter sign %+.0f\n",
+-		            in_w, in_h, out_w, out_h, s.quality, s.depth_inverted ? 1 : 0,
++		            max_w, max_h, out_w, out_h, s.quality, s.depth_inverted ? 1 : 0,
+ 		            static_cast<double>(s.jitter_sign));
+ 		std::fflush(stdout);
+ 	}
++	slot->last_use  = ++s.use_counter;
++	s.feature_in_w  = in_w;
++	s.feature_in_h  = in_h;
++	s.feature_out_w = out_w;
++	s.feature_out_h = out_h;
+ 
+ 	// Layouts as Streamline's DLSS plugin uses them: inputs sampled, output storage.
+ 	mv.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderSampledRead, {}, cmd);
+@@ -622,12 +677,12 @@ bool RenderExecutor::TryDlssUpscale(CommandBuffer& buffer, PreparedBindings& pix
+ 	eval.InMVScaleX        = -static_cast<float>(in_w);
+ 	eval.InMVScaleY        = -static_cast<float>(in_h);
+ 	eval.InRenderSubrectDimensions = {in_w, in_h};
+-	eval.InReset = (s.last_frame != 0 && frame != s.last_frame + 1) ? 1 : 0;
+-	s.last_frame     = frame;
++	eval.InReset = (slot->last_frame == 0 || frame != slot->last_frame + 1) ? 1 : 0;
++	slot->last_frame = frame;
+ 	s.last_jitter[0] = eval.InJitterOffsetX;
+ 	s.last_jitter[1] = eval.InJitterOffsetY;
+ 	const auto result =
+-	    NGX_VULKAN_EVALUATE_DLSS_EXT(static_cast<VkCommandBuffer>(cmd), s.feature, s.params, &eval);
++	    NGX_VULKAN_EVALUATE_DLSS_EXT(static_cast<VkCommandBuffer>(cmd), slot->feature, s.params, &eval);
+ 	buffer.ForgetBoundState();
+ 	m_context.GetCommandScheduler().DeferOperation([device, views]() {
+ 		for (const auto view: views) {
+-- 
+2.55.0.windows.5
+

@@ -1,0 +1,54 @@
+From c345dee1546e4c5cd3eb55196af6f01b2940eccc Mon Sep 17 00:00:00 2001
+From: Marcelo Fernandes <marcelo_fis@hotmail.com>
+Date: Sun, 15 Nov 2026 22:29:08 -0300
+Subject: [PATCH 2/2] build(hybrid): handle paths with spaces in
+ build_kyty_gpu.py
+
+Ninja escapes spaces in command lines and quotes paths that contain them, but
+the link script split those lines on plain spaces and parsed -imsvc include
+paths only in their unquoted form. A build or include directory with a space
+therefore mangled the compile and link command lines. Parse quoted tokens and
+quote the /OUT:, /IMPLIB:, /PDB: and /DEF: arguments so such paths survive.
+---
+ tools/hybrid/build_kyty_gpu.py | 14 ++++++++------
+ 1 file changed, 8 insertions(+), 6 deletions(-)
+
+diff --git a/tools/hybrid/build_kyty_gpu.py b/tools/hybrid/build_kyty_gpu.py
+index 77de9b0..39fad63 100644
+--- a/tools/hybrid/build_kyty_gpu.py
++++ b/tools/hybrid/build_kyty_gpu.py
+@@ -58,7 +58,9 @@ def variables(block):
+ 
+ 
+ def ninja_paths(text):
+-    return [part.replace("$:", ":").replace("$ ", " ") for part in re.split(r"(?<!\$) ", text) if part]
++    # Ninja escapes spaces as "$ " (or "$:" for colons) and quotes paths that contain spaces.
++    parts = re.findall(r'"[^"]*"|\S+', text)
++    return [p[1:-1] if p.startswith('"') and p.endswith('"') else p.replace("$:", ":").replace("$ ", " ") for p in parts]
+ 
+ 
+ def main():
+@@ -84,9 +86,9 @@ def main():
+     bridge_obj = out / "kytyGpuBridge.obj"
+     compile_cmd = [str(llvm / "clang-cl.exe"), "/nologo", "/c"] + compile_block["DEFINES"].split() + compile_block["FLAGS"].split()
+     compile_cmd += [f"/DKYTY_GPU_BUILD_ID={compile_block.get('CONFIG', 'Release')}"]
+-    for quoted, plain, system in re.findall(r'-I"([^"]+)"|-I(\S+)|-imsvc(\S+)', compile_block["INCLUDES"]):
+-        if system:
+-            compile_cmd.append("/imsvc" + system.replace("$:", ":"))
++    for quoted, plain, sysq, sysp in re.findall(r'-I"([^"]+)"|-I(\S+)|-imsvc"([^"]+)"|-imsvc(\S+)', compile_block["INCLUDES"]):
++        if sysq or sysp:
++            compile_cmd.append("/imsvc" + (sysq or sysp).replace("$:", ":"))
+         else:
+             compile_cmd.append("/I" + (quoted or plain).replace("$:", ":"))
+     print("compile: src/hybrid/kytyGpuBridge.cpp", flush=True)
+@@ -102,8 +104,8 @@ def main():
+ 
+     response = out / "kyty_gpu.link.rsp"
+     lines = ["/NOLOGO", "/DLL", "/MACHINE:X64", "/INCREMENTAL:NO", "/DEBUG:FULL", "/OPT:REF", "/OPT:ICF",
+-             f"/OUT:{out / 'kyty_gpu.dll'}", f"/IMPLIB:{out / 'kyty_gpu.lib'}", f"/PDB:{out / 'kyty_gpu.pdb'}",
+-             f"/DEF:{ROOT / 'src/hybrid/kyty_gpu.def'}", f'"{bridge_obj}"']
++             f'/OUT:"{out / "kyty_gpu.dll"}"', f'/IMPLIB:"{out / "kyty_gpu.lib"}"', f'/PDB:"{out / "kyty_gpu.pdb"}"',
++             f'/DEF:"{ROOT / "src/hybrid/kyty_gpu.def"}"', f'"{bridge_obj}"']
+     lines += [f'"{build / o}"' for o in objects]
+     for library in libraries:
+         path = pathlib.Path(library)

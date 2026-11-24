@@ -1,0 +1,87 @@
+From 0edfcf192b79cdcee2866945271198c26d1b9c64 Mon Sep 17 00:00:00 2001
+From: Codex <local@invalid>
+Date: Fri, 20 Nov 2026 01:01:57 +0000
+Subject: [PATCH 48/49] fix(vram): place a buffer that does not fit video
+ memory in system memory
+
+A 272 MB buffer at 4K on an 8 GB card was refused within and past the budget and ended the game
+with ErrorOutOfDeviceMemory (pcportastrobot #155). As images do since 1.2.2, the last retry places
+it in system memory (VMA_MEMORY_USAGE_AUTO_PREFER_HOST): slower for the GPU, but the game goes on.
+KYTY_DEBUG_FAIL_BUFFER_ALLOC=N makes the first N video-memory attempts fail, to test it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../host_gpu/renderer/cache/streamBuffer.cpp  | 33 ++++++++++++++++---
+ 1 file changed, 29 insertions(+), 4 deletions(-)
+
+diff --git a/src/graphics/host_gpu/renderer/cache/streamBuffer.cpp b/src/graphics/host_gpu/renderer/cache/streamBuffer.cpp
+index 27b15abb..72f43b4a 100644
+--- a/src/graphics/host_gpu/renderer/cache/streamBuffer.cpp
++++ b/src/graphics/host_gpu/renderer/cache/streamBuffer.cpp
+@@ -135,7 +135,18 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
+ 
+ 	VmaAllocationInfo allocation_result {};
+ 	VkBuffer          native_buffer = VK_NULL_HANDLE;
+-	const auto        create        = [&] {
++	// KYTY_DEBUG_FAIL_BUFFER_ALLOC=N (test): the first N attempts that prefer video memory fail as if
++	// it were full, to exercise the fallbacks below.
++	static std::atomic<int64_t> debug_fail_remaining {[] {
++		const auto* value = std::getenv("KYTY_DEBUG_FAIL_BUFFER_ALLOC");
++		return value != nullptr ? std::strtoll(value, nullptr, 10) : int64_t {0};
++	}()};
++	const auto create = [&] {
++		if (allocation_info.usage != VMA_MEMORY_USAGE_AUTO_PREFER_HOST &&
++		    debug_fail_remaining.load(std::memory_order_relaxed) > 0 &&
++		    debug_fail_remaining.fetch_sub(1, std::memory_order_relaxed) > 0) {
++			return vk::Result::eErrorOutOfDeviceMemory;
++		}
+ 		return static_cast<vk::Result>(vmaCreateBuffer(
+ 		    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
+ 		    &native_buffer, &m_allocation, &allocation_result));
+@@ -144,17 +155,30 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
+ 	if (result != vk::Result::eSuccess) {
+ 		// Out of budget (VRAM full: a big texture pack, a smaller card). Not fatal: release what is
+ 		// only retained for reuse and retry, then retry past the budget. Windows (WDDM) then pages
+-		// the allocation to system memory, slower but running; only a refusal of that stops here.
++		// the allocation to system memory, slower but running.
+ 		graphics.LogMemoryBudget();
+ 		const auto released = graphics.ReleaseRetainedMemory();
+ 		result              = create();
+ 		bool over_budget    = false;
++		bool system_memory  = false;
+ 		if (result != vk::Result::eSuccess) {
+ 			allocation_info.flags &= ~static_cast<VmaAllocationCreateFlags>(
+ 			    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT);
+ 			result      = create();
+ 			over_budget = result == vk::Result::eSuccess;
+ 		}
++		if (result != vk::Result::eSuccess) {
++			// Still refused (pcportastrobot #155: a 272 MB buffer at 4K on an 8 GB card ended the game
++			// with ErrorOutOfDeviceMemory): place it in system memory, as images do since 1.2.2. The
++			// GPU reads it over PCIe, slower, but the game goes on.
++			allocation_info.usage          = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
++			allocation_info.requiredFlags  = 0;
++			allocation_info.preferredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++			allocation_info.flags &= ~static_cast<VmaAllocationCreateFlags>(
++			    VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT);
++			result        = create();
++			system_memory = result == vk::Result::eSuccess;
++		}
+ 		static std::atomic<uint32_t> reported {0};
+ 		if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+ 			Log::WriteToConsoleAndLog(fmt::format(
+@@ -163,8 +187,9 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
+ 			    size, released,
+ 			    result != vk::Result::eSuccess
+ 			        ? vk::to_string(result)
+-			        : std::string(over_budget ? "created past the budget (may page to system memory)"
+-			                                  : "created")));
++			        : std::string(system_memory ? "created in system memory (slower)"
++			                      : over_budget ? "created past the budget (may page to system memory)"
++			                                    : "created")));
+ 		}
+ 	}
+ 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+-- 
+2.55.0.windows.5
+

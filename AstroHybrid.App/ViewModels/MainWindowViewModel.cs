@@ -1,6 +1,9 @@
 using System;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.IO;
+using System.IO.Compression;
+using System.Linq;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Input;
@@ -47,6 +50,9 @@ namespace AstroHybrid.App.ViewModels
 
         public static MainWindowViewModel? Current { get; private set; }
 
+        // The game folder (the one with Run-AstroHybrid.bat).
+        public string RootDirectory => _rootDirectory;
+
         public MainWindowViewModel(string rootDirectory)
         {
             Current = this;
@@ -73,19 +79,23 @@ namespace AstroHybrid.App.ViewModels
             NavigateCommand = new RelayCommand<LauncherPage>(page => CurrentPage = page);
             LaunchGameCommand = new RelayCommand(async () => await LaunchGameAsync(), () => !IsLaunching);
             ApplyBestSettingsCommand = new RelayCommand(ApplyBestSettings);
+            OpenSupportCommand = new RelayCommand(() => OpenLink(SupportUrl));
+            OpenContributeCommand = new RelayCommand(() => OpenLink(ContributeUrl));
             RefreshControllersCommand = new RelayCommand(RefreshControllers);
             RepairInstallationCommand = new RelayCommand(async () => await RepairInstallationAsync());
             RebuildInstallationCommand = new RelayCommand(async () => await RebuildInstallationAsync());
             OpenInstallFolderCommand = new RelayCommand(() => _installationManager.OpenInstallFolder());
             OpenLogFolderCommand = new RelayCommand(() => _installationManager.OpenLogFolder());
+            ExportSupportLogsCommand = new RelayCommand(ExportSupportLogs);
             ChangeInstallLocationCommand = new RelayCommand(async () => await ChangeInstallLocationAsync());
             UninstallCommand = new RelayCommand(async () => await UninstallAsync());
 
             // Update commands
             CheckForUpdatesCommand = new RelayCommand(async () => await CheckForUpdatesAsync(true));
-            DownloadUpdateCommand = new RelayCommand(async () => await DownloadAndInstallUpdateAsync(), () => UpdateState.UpdateAvailable && !UpdateState.IsDownloading && !UpdateState.IsInstalling);
+             DownloadUpdateCommand = new RelayCommand(async () => await DownloadAndInstallUpdateAsync(), () => HasUpdateAction && !UpdateState.IsDownloading && !UpdateState.IsInstalling);
             IgnoreUpdateCommand = new RelayCommand(IgnoreUpdate);
             DismissUpdateNotificationCommand = new RelayCommand(() => ShowUpdateNotification = false);
+            RestartToUpdateCommand = new RelayCommand(async () => await RestartToUpdateAsync(), () => UpdateState.IsReadyToRestart);
 
             _ = InitializeAsync();
         }
@@ -141,6 +151,13 @@ namespace AstroHybrid.App.ViewModels
             set => SetProperty(ref _updateState, value);
         }
 
+        public bool HasUpdateAction => (UpdateState.UpdateAvailable || UpdateState.IgnoredUpdate != null) && !UpdateState.IsReadyToRestart;
+
+        // The update is downloaded and unpacked: the banner and the dock show "Restart launcher".
+        public bool IsUpdateReady => UpdateState.IsReadyToRestart;
+
+        public bool HasIgnoredUpdate => !UpdateState.UpdateAvailable && UpdateState.IgnoredUpdate != null;
+
         public bool ShowUpdateNotification
         {
             get => _showUpdateNotification;
@@ -165,14 +182,43 @@ namespace AstroHybrid.App.ViewModels
             set => SetProperty(ref _statusMessage, value);
         }
 
+        public string AppVersionText
+        {
+            get
+            {
+                var v = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version;
+                return v != null ? $"AstroHybrid v{v.Major}.{v.Minor}.{v.Build}" : "AstroHybrid";
+            }
+        }
+
         public ICommand NavigateCommand { get; }
         public ICommand LaunchGameCommand { get; }
         public ICommand ApplyBestSettingsCommand { get; }
+
+        // "Fund me" card in the sidebar and the "help the project" banner on the Overview page.
+        public const string SupportUrl = "https://ko-fi.com/justhappyguy";
+        public const string ContributeUrl = "https://github.com/imnotsharingmyname/pcportastrobot";
+        public ICommand OpenSupportCommand { get; }
+        public ICommand OpenContributeCommand { get; }
+
+        private void OpenLink(string url)
+        {
+            try
+            {
+                Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+            }
+            catch (Exception ex)
+            {
+                StatusMessage = "Could not open the browser";
+                MessageBox.Show($"Could not open {url}\n{ex.Message}", "AstroHybrid", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+        }
         public ICommand RefreshControllersCommand { get; }
         public ICommand RepairInstallationCommand { get; }
         public ICommand RebuildInstallationCommand { get; }
         public ICommand OpenInstallFolderCommand { get; }
         public ICommand OpenLogFolderCommand { get; }
+        public ICommand ExportSupportLogsCommand { get; }
         public ICommand ChangeInstallLocationCommand { get; }
         public ICommand UninstallCommand { get; }
 
@@ -181,6 +227,7 @@ namespace AstroHybrid.App.ViewModels
         public ICommand DownloadUpdateCommand { get; }
         public ICommand IgnoreUpdateCommand { get; }
         public ICommand DismissUpdateNotificationCommand { get; }
+        public ICommand RestartToUpdateCommand { get; }
 
         private async Task InitializeAsync()
         {
@@ -210,6 +257,14 @@ namespace AstroHybrid.App.ViewModels
                     Settings.ApplyBestOnStart = false;
                     ApplyBestSettings();
                 }
+
+                ResolveAutoGraphics();
+                bool fsrFrameGen = LauncherService.FsrFrameGenRuntimeAvailable(_rootDirectory);
+                if (HardwareInfo != null)
+                    Settings.Sanitize(HardwareInfo.SupportsDlss, HardwareInfo.SupportsFrameGeneration, HardwareInfo.SupportsReflex, HardwareInfo.MaxFrameGenMultiplier, fsrFrameGen);
+                else
+                    Settings.Sanitize(supportsFsrFrameGen: fsrFrameGen);
+                _settingsManager.Save(Settings);
 
                 StatusMessage = InstallationState?.IsInstalled == true ? "Ready" : "Setup required";
 
@@ -268,6 +323,9 @@ namespace AstroHybrid.App.ViewModels
                 return;
             }
 
+            if (!await EnsureGameLinkAsync())
+                return;
+
             IsLaunching = true;
             StatusMessage = "Launching Astro Bot...";
 
@@ -289,6 +347,14 @@ namespace AstroHybrid.App.ViewModels
                 }
 
                 StatusMessage = exitCode == 0 ? "Game exited normally" : $"Game exited with code {exitCode}";
+                if (exitCode != 0)
+                {
+                    var detail = DescribeExitFailure(exitCode);
+                    if (!string.IsNullOrEmpty(detail))
+                    {
+                        MessageBox.Show(detail, "AstroHybrid - Game Exited With Error", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    }
+                }
             }
             catch (Exception ex)
             {
@@ -311,11 +377,14 @@ namespace AstroHybrid.App.ViewModels
             Settings.Fps = 0; // 30 FPS steady
             Settings.Speed = 0; // 100% real-time
             Settings.Size = best.Size;
+            Settings.Ultrawide = best.Ultrawide;
             Settings.Fullscreen = true;
             Settings.Upscale = best.Upscale;
             Settings.FrameGenMode = best.FrameGen;
             Settings.FrameGenTarget = best.Target;
             Settings.LowLatency = best.LowLatency;
+            Settings.UpscaleAuto = true;
+            Settings.FrameGenAuto = true;
             Settings.Controller = 0; // Auto
             Settings.RumblePercent = 70; // Medium
             Settings.Rumble = RumbleSetting.ToLegacyIndex(70);
@@ -323,6 +392,56 @@ namespace AstroHybrid.App.ViewModels
             _settingsManager.Save(Settings);
             StatusMessage = "Applied best settings for this PC";
         }
+
+        // Graphics page "Auto": the upscaler and frame generation the selected card supports best.
+        // Called at start-up (the card or driver may have changed) and when the card or the choice changes.
+        public void ResolveAutoGraphics()
+        {
+            if (HardwareInfo == null) return;
+            var best = PickBestSettings(HardwareInfo);
+            if (Settings.UpscaleAuto) Settings.Upscale = best.Upscale;
+            if (Settings.FrameGenAuto)
+            {
+                bool wasOff = Settings.FrameGenMode == 0;
+                Settings.FrameGenMode = Settings.Upscale != 1 ? 0 : best.FrameGen;
+                if (wasOff && Settings.FrameGenMode != 0) Settings.FrameGenTarget = best.Target;
+            }
+            if (Settings.Upscale != 1) Settings.FrameGenMode = 0;
+            // AMD FSR frame generation is the other frame generator: off while NVIDIA's is on.
+            if (Settings.FrameGenMode != 0) Settings.FsrFrameGen = false;
+        }
+
+        // Restore Defaults on the Graphics page: graphics only. Controller, language, game folder and
+        // advanced (system) options stay as they are.
+        public void RestoreGraphicsDefaults()
+        {
+            if (HardwareInfo == null) return;
+            var defaults = new AppSettings();
+            var best = PickBestSettings(HardwareInfo);
+            Settings.Lighting = defaults.Lighting;
+            Settings.Fps = defaults.Fps;
+            Settings.Size = best.Size;
+            Settings.Ultrawide = best.Ultrawide;
+            Settings.Fullscreen = defaults.Fullscreen;
+            Settings.VSync = defaults.VSync;
+            Settings.Overlay = defaults.Overlay;
+            Settings.DlssQuality = defaults.DlssQuality;
+            Settings.Gpu = -1;
+            HardwareInfo.SelectGpu(-1);
+            best = PickBestSettings(HardwareInfo);
+            Settings.UpscaleAuto = true;
+            Settings.FrameGenAuto = true;
+            Settings.Upscale = best.Upscale;
+            Settings.FrameGenMode = best.FrameGen;
+            Settings.FrameGenTarget = best.Target;
+            Settings.LowLatency = best.LowLatency;
+            _settingsManager.Save(Settings);
+            StatusMessage = "Graphics settings restored to the defaults for this PC";
+            OnPropertyChanged(nameof(HardwareInfo));
+            OnPropertyChanged(nameof(Settings));
+        }
+
+        internal (int Size, bool Ultrawide, int Upscale, int FrameGen, int Target, bool LowLatency) BestSettingsFor(HardwareInfo pc) => PickBestSettings(pc);
 
         private void RefreshControllers()
         {
@@ -339,6 +458,43 @@ namespace AstroHybrid.App.ViewModels
 
         }
 
+        // A moved or disconnected dump leaves Build\RunHybrid\app0 pointing nowhere, and the game then stops at
+        // start (#44). Check before launching and offer the repair instead. Returns true when the game may start.
+        private async Task<bool> EnsureGameLinkAsync()
+        {
+            string? problem;
+            try
+            {
+                problem = GameSetup.DescribeBrokenGameLink(System.IO.Path.Combine(_rootDirectory, "Build", "RunHybrid"));
+            }
+            catch
+            {
+                return true; // never block a launch because the check itself failed
+            }
+            if (problem == null)
+                return true;
+
+            bool dumpFound = !string.IsNullOrEmpty(Settings.GameDumpPath) &&
+                             System.IO.File.Exists(System.IO.Path.Combine(Settings.GameDumpPath, "eboot.bin"));
+            var message = $"Astro Bot can't start: {problem}.\n\n" +
+                          (dumpFound
+                              ? "This usually means the game links are out of date. Repair the installation now?"
+                              : $"The game dump{(string.IsNullOrEmpty(Settings.GameDumpPath) ? "" : $" ({Settings.GameDumpPath})")} was moved, renamed or is on a drive that is not connected. " +
+                                "Connect the drive and press Play again, or choose the dump's new folder and repair now?");
+            if (MessageBox.Show(message, "AstroHybrid", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes)
+                return false;
+            var savedDump = Settings.GameDumpPath;
+            if (!dumpFound)
+            {
+                // RepairInstallationAsync asks for the folder when none is saved.
+                Settings.GameDumpPath = "";
+            }
+            await RepairInstallationAsync();
+            if (string.IsNullOrEmpty(Settings.GameDumpPath))
+                Settings.GameDumpPath = savedDump; // folder dialog cancelled: keep the old path
+            return false;
+        }
+
         private async Task RepairInstallationAsync()
         {
             if (string.IsNullOrEmpty(Settings.GameDumpPath))
@@ -353,6 +509,8 @@ namespace AstroHybrid.App.ViewModels
                         MessageBox.Show(info.ValidationError ?? "That folder is not an Astro Bot dump.", "AstroHybrid", MessageBoxButton.OK, MessageBoxImage.Warning);
                         return;
                     }
+                    if (!string.IsNullOrEmpty(info.Warning))
+                        MessageBox.Show(info.Warning, "AstroHybrid - Game version", MessageBoxButton.OK, MessageBoxImage.Warning);
                     Settings.GameDumpPath = dialog.SelectedPath;
                     _settingsManager.Save(Settings);
                 }
@@ -402,6 +560,8 @@ namespace AstroHybrid.App.ViewModels
                         MessageBox.Show(info.ValidationError ?? "That folder is not an Astro Bot dump.", "AstroHybrid", MessageBoxButton.OK, MessageBoxImage.Warning);
                         return;
                     }
+                    if (!string.IsNullOrEmpty(info.Warning))
+                        MessageBox.Show(info.Warning, "AstroHybrid - Game version", MessageBoxButton.OK, MessageBoxImage.Warning);
                     Settings.GameDumpPath = dialog.SelectedPath;
                     _settingsManager.Save(Settings);
                 }
@@ -439,12 +599,12 @@ namespace AstroHybrid.App.ViewModels
 
         private async Task ChangeInstallLocationAsync()
         {
-            var dialog = new System.Windows.Forms.FolderBrowserDialog
+            using (var dialog = new System.Windows.Forms.FolderBrowserDialog
             {
                 Description = "Select new installation location",
                 ShowNewFolderButton = true
-            };
-
+            })
+            {
             if (dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK)
             {
                 IsLoading = true;
@@ -464,6 +624,7 @@ namespace AstroHybrid.App.ViewModels
                 {
                     IsLoading = false;
                 }
+            }
             }
         }
 
@@ -499,16 +660,40 @@ namespace AstroHybrid.App.ViewModels
         }
 
         // Best settings logic (ported from AstroBotLauncher.cs)
-        private (int Size, int Upscale, int FrameGen, int Target, bool LowLatency) PickBestSettings(HardwareInfo pc)
+        private (int Size, bool Ultrawide, int Upscale, int FrameGen, int Target, bool LowLatency) PickBestSettings(HardwareInfo pc)
         {
-            var best = (Size: 2, Upscale: 0, FrameGen: 0, Target: 2, LowLatency: false);
+            var best = (Size: 2, Ultrawide: false, Upscale: 0, FrameGen: 0, Target: 2, LowLatency: false);
 
-            for (int i = 0; i < 4; i++)
+            var displayAspect = pc.ScreenHeight > 0 ? (double)pc.ScreenWidth / pc.ScreenHeight : 16.0 / 9.0;
+            if (displayAspect >= 3.2)
             {
-                var widths = new[] { 1280, 1600, 1920, 2560 };
-                var heights = new[] { 720, 900, 1080, 1440 };
-                if (widths[i] <= pc.ScreenWidth && heights[i] <= pc.ScreenHeight)
-                    best.Size = i;
+                best.Ultrawide = true;
+                best.Size = pc.ScreenWidth >= 5120 && pc.ScreenHeight >= 1440 ? 6
+                          : pc.ScreenWidth >= 3840 && pc.ScreenHeight >= 1080 ? 7 : 4;
+            }
+            else if (displayAspect >= 2.1)
+            {
+                best.Ultrawide = true;
+                best.Size = pc.ScreenWidth >= 5120 && pc.ScreenHeight >= 2160 ? 8
+                          : pc.ScreenWidth >= 3440 && pc.ScreenHeight >= 1440 ? 5 : 4;
+            }
+            else
+            {
+                foreach (var i in new[] { 0, 1, 2, 3, 9 })
+                {
+                    var preset = AppSettings.ResolutionPresets[i];
+                    if (preset.Width <= pc.ScreenWidth && preset.Height <= pc.ScreenHeight)
+                        best.Size = i;
+                }
+            }
+
+            // Cards with less than 11 GB of video memory run out at 4K and 5K (#155, #170: 8 GB cards at 4K
+            // ended with ErrorOutOfDeviceMemory; #161: an 8 GB laptop GPU was offered 4K). Stay at 1440p there.
+            int vramMb = pc.SelectedGpu?.VramMb ?? 0;
+            if (vramMb > 0 && vramMb < 11 * 1024)
+            {
+                if (best.Size == 9) best.Size = 3;   // 3840x2160 -> 2560x1440
+                if (best.Size == 8) best.Size = 5;   // 5120x2160 -> 3440x1440
             }
 
             if (pc.RtxSeries >= 20)
@@ -544,14 +729,23 @@ namespace AstroHybrid.App.ViewModels
                     ShowUpdateNotification = true;
                 }
             }
-            else if (!state.UpdateAvailable)
+            else if (!state.UpdateAvailable && !state.IsBusy && !state.IsReadyToRestart)
             {
                 ShowUpdateNotification = false;
+            }
+            // Keep the banner (and its progress line) on screen for the whole update.
+            if (state.IsBusy || state.IsReadyToRestart)
+            {
+                ShowUpdateNotification = true;
             }
 
             // Refresh command states
             OnPropertyChanged(nameof(UpdateState));
+            OnPropertyChanged(nameof(HasUpdateAction));
+            OnPropertyChanged(nameof(HasIgnoredUpdate));
+            OnPropertyChanged(nameof(IsUpdateReady));
             (DownloadUpdateCommand as RelayCommand)?.RaiseCanExecuteChanged();
+            (RestartToUpdateCommand as RelayCommand)?.RaiseCanExecuteChanged();
         }
 
         private async Task CheckForUpdatesAsync(bool forceCheck = false)
@@ -570,7 +764,9 @@ namespace AstroHybrid.App.ViewModels
         {
             if (_updateService == null || UpdateState.LatestUpdate == null) return;
 
-            var updateInfo = UpdateState.LatestUpdate;
+            var updateInfo = UpdateState.LatestUpdate ?? UpdateState.IgnoredUpdate;
+            if (updateInfo == null) return;
+            ShowUpdateNotification = true;
 
             // Download the update
             var downloadSuccess = await _updateService.DownloadUpdateAsync(updateInfo);
@@ -583,17 +779,32 @@ namespace AstroHybrid.App.ViewModels
             var installSuccess = await _updateService.InstallUpdateAsync(updateInfo);
             if (installSuccess)
             {
-                ShowUpdateNotification = false;
-                UpdateState.UpdateAvailable = false;
-                UpdateState.LatestUpdate = null;
-
+                // The banner now shows "Restart launcher" (RestartToUpdateAsync finishes the update).
                 // Clear ignored version since we updated
                 var settings = _settingsManager.Load();
                 settings.IgnoredUpdateVersion = null;
                 _settingsManager.Save(settings);
 
-                // Restart the launcher
-                RestartLauncher();
+            }
+        }
+
+        private async Task RestartToUpdateAsync()
+        {
+            if (_updateService == null) return;
+            if (IsLaunching || _launcherService.IsGameRunning())
+            {
+                MessageBox.Show("Close Astro Bot first, then press Restart launcher to finish the update.",
+                    "AstroHybrid", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+            try
+            {
+                await _updateService.RestartToApplyUpdateAsync();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"The update could not be finished: {ex.Message}\n\nPress Update to download it again.",
+                    "AstroHybrid", MessageBoxButton.OK, MessageBoxImage.Warning);
             }
         }
 
@@ -604,6 +815,12 @@ namespace AstroHybrid.App.ViewModels
                 _updateService?.IgnoreVersion(UpdateState.LatestUpdate.Version);
                 ShowUpdateNotification = false;
                 UpdateState.IgnoredVersion = UpdateState.LatestUpdate.Version;
+                UpdateState.IgnoredUpdate = UpdateState.LatestUpdate;
+                UpdateState.LatestUpdate = null;
+                UpdateState.UpdateAvailable = false;
+                OnPropertyChanged(nameof(UpdateState));
+                OnPropertyChanged(nameof(HasUpdateAction));
+                OnPropertyChanged(nameof(HasIgnoredUpdate));
             }
         }
 
@@ -624,6 +841,106 @@ namespace AstroHybrid.App.ViewModels
             {
                 // Fallback: just close
                 System.Windows.Application.Current.Shutdown();
+            }
+        }
+
+        private string DescribeExitFailure(int exitCode)
+        {
+            string logSnippet = "";
+            try
+            {
+                foreach (var logName in new[] { "hybrid-run.err.log", "hybrid-run.out.log" })
+                {
+                    var path = Path.Combine(_rootDirectory, "Logs", logName);
+                    if (!File.Exists(path)) continue;
+                    var hint = HintFromLog(File.ReadAllText(path), Settings.GameVersion, out bool wholeMessage);
+                    if (hint == null) continue;
+                    if (wholeMessage) return hint;
+                    logSnippet = hint;
+                    break;
+                }
+            }
+            catch { }
+
+            if (exitCode == 321 && string.IsNullOrEmpty(logSnippet))
+                logSnippet = "Renderer initialization or runtime failure (code 321). Make sure your GPU supports Vulkan VK_EXT_mesh_shader and drivers are up to date.";
+            else if (exitCode == -1073741819 && string.IsNullOrEmpty(logSnippet))
+                logSnippet = "Access violation (0xC0000005). Try 'Repair Installation' on the Installation page.";
+            else if (exitCode == -1073740791 && string.IsNullOrEmpty(logSnippet))
+                logSnippet = "The game stopped itself after a fatal error (0xC0000409). The last lines of Logs\\hybrid-run.err.log say which one; please attach both logs when you report it.";
+
+            if (string.IsNullOrEmpty(logSnippet)) return "";
+            return $"Astro Bot exited with code {exitCode}.\n\n{logSnippet}\n\nLogs are in Logs\\hybrid-run.out.log and Logs\\hybrid-run.err.log (or use 'Export Support Logs' on the Installation page).";
+        }
+
+        // Turns the text of a game log into advice for the player, or null when nothing known is in it.
+        // wholeMessage: the hint replaces the whole dialog text (no exit code / log paths around it).
+        public static string? HintFromLog(string text, string? gameVersion, out bool wholeMessage)
+        {
+            wholeMessage = false;
+            bool Has(string s) => text.IndexOf(s, StringComparison.OrdinalIgnoreCase) >= 0;
+            if (Has("VK_EXT_mesh_shader") || Has("meshShader"))
+            {
+                wholeMessage = true;
+                return "Your GPU or Vulkan driver does not support VK_EXT_mesh_shader (required by Astro Bot's NGG mesh shaders).\n\nIf you have an RTX 20+, RX 6000+, or Intel Arc GPU, update your GPU drivers or select your discrete GPU in Graphics Settings.\n(Older GPUs such as GTX 10/16 or RX 5000/RDNA1 lack hardware mesh shader support.)";
+            }
+            // Kyty prints Vulkan results by their vk::Result names ("ErrorDeviceLost"), not VK_ERROR_* (#66).
+            if (Has("VK_ERROR_DEVICE_LOST") || Has("ErrorDeviceLost"))
+                return "The graphics driver reset the GPU (Vulkan device lost). Update the GPU driver, close GPU overlays and recording tools, and try a lower resolution or Frame Generation off. If it keeps happening at the same spot, please report it with the logs.";
+            // Video memory ran out (#107, #6): Kyty stops when an image or sparse image can't be allocated.
+            if (Has("ErrorOutOfDeviceMemory") || Has("failed to create image") || Has("allocate sparse image memory failed"))
+                return "The GPU ran out of video memory. Lower the resolution, use 'Ray Tracing OFF' (faster lighting), turn Frame Generation off, and close other programs that use the GPU (browsers, recording, overlays). Cards with 8 GB or less are the most affected.";
+            // A PS5 system function the runtime does not provide yet (#73, #53): name it so it can be reported.
+            var notImplemented = System.Text.RegularExpressions.Regex.Match(text, @"what\(\):\s+(\S[^\r\n]*?) not implemented");
+            if (notImplemented.Success)
+                return $"The game called a PS5 system function that AstroHybrid does not support yet ({notImplemented.Groups[1].Value}). Please report this with the logs; it usually happens at the same place every time.";
+            if (Has("param.json or param.sfo not found"))
+                return "The game's files could not be found (param.json). The dump was probably moved, renamed or is on a drive that is not connected. Reconnect it, or use 'Repair Installation' on the Installation page and pick the dump's current folder.";
+            // Game asserts in the asset loader (#54, #47, #80, #130): seen only on game version 01.007.000.
+            if (Has("ObjectDefinitionContext") || Has("Duplicated definition name") ||
+                (Has("Xml.cpp:") && Has("is broken and failed to load")))
+            {
+                return "The game stopped in its asset loader (\"Duplicated definition name\" / \"Xml file is broken\"). " +
+                       ((gameVersion ?? "").StartsWith(GameValidator.KnownBadVersion)
+                           ? "Your dump is game version 01.007.000, which is known to crash this way. Please update the dump to 01.019.000 and run 'Repair Installation'."
+                           : "This is known from game version 01.007.000; 01.019.000 is recommended. If your dump is already 01.019.000, please report it with the logs.");
+            }
+            return null;
+        }
+
+        private void ExportSupportLogs()
+        {
+            try
+            {
+                var logsDir = Path.Combine(_rootDirectory, "Logs");
+                Directory.CreateDirectory(logsDir);
+                var zipPath = Path.Combine(logsDir, $"astrohybrid-support-{DateTime.Now:yyyyMMdd-HHmmss}.zip");
+                using (var archive = ZipFile.Open(zipPath, ZipArchiveMode.Create))
+                {
+                    var candidates = new[]
+                    {
+                        Path.Combine(logsDir, "setup.log"),
+                        Path.Combine(logsDir, "setup-relinker.log"),
+                        Path.Combine(logsDir, "hybrid-run.out.log"),
+                        Path.Combine(logsDir, "hybrid-run.err.log"),
+                        Path.Combine(_rootDirectory, "Build", "astrohybrid-settings.json"),
+                        Path.Combine(_rootDirectory, "Build", "RunHybrid", "astrohybrid-game.json")
+                    };
+                    foreach (var file in candidates)
+                    {
+                        if (File.Exists(file))
+                        {
+                            archive.CreateEntryFromFile(file, Path.GetFileName(file));
+                        }
+                    }
+                }
+                StatusMessage = $"Exported support logs to {Path.GetFileName(zipPath)}";
+                MessageBox.Show($"Support logs bundle created (no copyrighted game files included):\n{zipPath}",
+                    "Export Support Logs", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Failed to export logs: {ex.Message}", "Export Support Logs", MessageBoxButton.OK, MessageBoxImage.Error);
             }
         }
     }

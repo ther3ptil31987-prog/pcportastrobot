@@ -147,6 +147,7 @@ namespace AstroHybrid.App.Services
                     };
                     ClassifyGpu(gpu);
                     ApplyFeatureSupport(gpu);
+                    gpu.VramMb = VideoMemoryMb(pnp);
 
                     // Windows can list one card twice (two drivers bound to it); keep the first.
                     if (adapters.Exists(a => SameAdapter(a.Name, gpu.Name))) continue;
@@ -178,6 +179,32 @@ namespace AstroHybrid.App.Services
             }
 
             return adapters;
+        }
+
+        // Dedicated video memory of the card with this PNP device ID, in MiB, from its display driver key
+        // (HardwareInformation.qwMemorySize; Win32_VideoController.AdapterRAM stops at 4 GB). 0 when unknown.
+        private static int VideoMemoryMb(string pnpDeviceId)
+        {
+            if (string.IsNullOrEmpty(pnpDeviceId)) return 0;
+            try
+            {
+                var device = pnpDeviceId.Split('\\');
+                var hardwareId = device.Length >= 2 ? (device[0] + "\\" + device[1]).ToLowerInvariant() : pnpDeviceId.ToLowerInvariant();
+                using var displayClass = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
+                    @"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}");
+                if (displayClass == null) return 0;
+                foreach (var subName in displayClass.GetSubKeyNames())
+                {
+                    using var key = displayClass.OpenSubKey(subName);
+                    var matching = (key?.GetValue("MatchingDeviceId") as string ?? "").ToLowerInvariant();
+                    if (matching.Length == 0 || !hardwareId.StartsWith(matching, StringComparison.Ordinal)) continue;
+                    var value = key?.GetValue("HardwareInformation.qwMemorySize");
+                    long bytes = value is long l ? l : value is byte[] b && b.Length >= 8 ? BitConverter.ToInt64(b, 0) : 0;
+                    if (bytes > 0) return (int)(bytes / (1024 * 1024));
+                }
+            }
+            catch { }
+            return 0;
         }
 
         // Name of the adapter Windows uses for the desktop (the integrated one on most laptops).

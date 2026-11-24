@@ -1,0 +1,272 @@
+{
+  "$schema": "https://recomplauncher.com/schema/recomplauncher.json",
+  "format": 1,
+  "name": "Astro Bot (AstroHybrid)",
+  "repo": "imnotsharingmyname/pcportastrobot",
+  "game": {
+    "kind": "folder",
+    "label": "Your decrypted PS5 dump folder of Astro Bot, with eboot.bin, sce_sys and data (or app0.zar) inside (PPSA21567, v01.019.000 or v01.007.000).",
+    "check": { "file": "eboot.bin" }
+  },
+  "prepare": {
+    "program": ["AstroHybrid.exe"],
+    "args": ["--setup", "{game}"],
+    "label": "Converting Astro Bot for Windows from your dump",
+    "done": ["{install}/Build/RunHybrid/AstroBot.exe"]
+  },
+  "start": {
+    "program": ["AstroHybrid.exe"],
+    "args": ["--play"]
+  },
+  "config": [
+    {
+      "format": "json",
+      "file": [{ "path": "{install}/Build/astrohybrid-settings.json" }],
+      "game_path": "gameDumpPath"
+    }
+  ],
+  "settings": [
+    {
+      "id": "preset",
+      "label": "Lighting",
+      "help": "Faster lighting runs smoother; ray-traced lighting looks closer to the PS5 but costs FPS.",
+      "group": "Graphics",
+      "choices": [
+        { "label": "Faster (recommended)", "set": { "lighting": "0" } },
+        { "label": "Ray-traced", "set": { "lighting": "1" } }
+      ],
+      "defaults": { "lighting": "0" }
+    },
+    {
+      "id": "resolution",
+      "label": "Resolution",
+      "help": "The window and output size. 8 GB graphics cards are best at 2560 x 1440 or lower.",
+      "group": "Graphics",
+      "choices": [
+        { "label": "1280 x 720", "set": { "size": "0", "ultrawide": "false" } },
+        { "label": "1600 x 900", "set": { "size": "1", "ultrawide": "false" } },
+        { "label": "1920 x 1080", "set": { "size": "2", "ultrawide": "false" } },
+        { "label": "2560 x 1440", "set": { "size": "3", "ultrawide": "false" } },
+        { "label": "3840 x 2160 (4K)", "set": { "size": "9", "ultrawide": "false" } },
+        { "label": "2560 x 1080 (21:9)", "set": { "size": "4", "ultrawide": "true" } },
+        { "label": "3440 x 1440 (21:9)", "set": { "size": "5", "ultrawide": "true" } },
+        { "label": "5120 x 2160 (21:9)", "set": { "size": "8", "ultrawide": "true" } },
+        { "label": "3840 x 1080 (32:9)", "set": { "size": "7", "ultrawide": "true" } },
+        { "label": "5120 x 1440 (32:9)", "set": { "size": "6", "ultrawide": "true" } }
+      ],
+      "defaults": { "size": "2", "ultrawide": "false" }
+    },
+    {
+      "id": "fullscreen",
+      "label": "Window mode",
+      "group": "Graphics",
+      "choices": [
+        { "label": "Fullscreen", "set": { "fullscreen": "true" } },
+        { "label": "Windowed", "set": { "fullscreen": "false" } }
+      ],
+      "defaults": { "fullscreen": "true" }
+    },
+    {
+      "id": "fps",
+      "label": "Frame rate limit",
+      "help": "The game is limited by the processor in heavy levels: 30 FPS gives the steadiest play. Game speed follows real time at any limit.",
+      "group": "Graphics",
+      "when": { "fgmode": "0" },
+      "choices": [
+        { "label": "30 FPS (steady)", "set": { "fps": "0" } },
+        { "label": "35 FPS", "set": { "fps": "1" } },
+        { "label": "45 FPS", "set": { "fps": "2" } },
+        { "label": "50 FPS", "set": { "fps": "3" } },
+        { "label": "55 FPS", "set": { "fps": "4" } },
+        { "label": "60 FPS", "set": { "fps": "5" } },
+        { "label": "No limit", "set": { "fps": "6" } }
+      ],
+      "defaults": { "fps": "0", "fgmode": "0" }
+    },
+    {
+      "id": "vsync",
+      "label": "VSync",
+      "help": "No tearing, a little more input delay. Works with frame generation too.",
+      "group": "Graphics",
+      "choices": [
+        { "label": "Off", "set": { "vsync": "false" } },
+        { "label": "On", "set": { "vsync": "true" } }
+      ],
+      "defaults": { "vsync": "true" }
+    },
+    {
+      "id": "upscaler",
+      "label": "Upscaling",
+      "help": "DLSS needs an NVIDIA RTX card. AMD FSR works on any card (FSR 4 on Radeon RX 9000, FSR 3.1 elsewhere).",
+      "group": "Upscaling and frame generation",
+      "choices": [
+        { "label": "Game's own", "set": { "upscale": "0", "upscaleAuto": "false" } },
+        { "label": "NVIDIA DLSS", "set": { "upscale": "1", "upscaleAuto": "false" } },
+        { "label": "AMD FSR", "set": { "upscale": "2", "upscaleAuto": "false" } }
+      ],
+      "defaults": { "upscale": "0", "upscaleAuto": "false" }
+    },
+    {
+      "id": "dlss-quality",
+      "label": "DLSS quality",
+      "group": "Upscaling and frame generation",
+      "when": { "upscale": "1" },
+      "choices": [
+        { "label": "Quality", "set": { "dlssQuality": "0" } },
+        { "label": "Balanced", "set": { "dlssQuality": "1" } },
+        { "label": "Performance", "set": { "dlssQuality": "2" } },
+        { "label": "DLAA (sharpest)", "set": { "dlssQuality": "3" } }
+      ],
+      "defaults": { "dlssQuality": "0" }
+    },
+    {
+      "id": "framegen",
+      "label": "Frame generation",
+      "help": "NVIDIA DLSS Frame Generation: RTX 40 or newer, and DLSS as the upscaler. 3x and 4x need an RTX 50 card.",
+      "group": "Upscaling and frame generation",
+      "when": { "upscale": "1" },
+      "choices": [
+        { "label": "Off", "set": { "fgmode": "0", "fgAuto": "false" } },
+        { "label": "Dynamic", "set": { "fgmode": "1", "fgAuto": "false" } },
+        { "label": "2x", "set": { "fgmode": "2", "fgAuto": "false" } },
+        { "label": "3x", "set": { "fgmode": "3", "fgAuto": "false" } },
+        { "label": "4x", "set": { "fgmode": "4", "fgAuto": "false" } }
+      ],
+      "defaults": { "fgmode": "0", "fgAuto": "false" }
+    },
+    {
+      "id": "framegen-target",
+      "label": "Frame generation target",
+      "help": "Frames shown per second with frame generation; the game itself runs at a fraction of it (60 on screen = 30 x2).",
+      "group": "Upscaling and frame generation",
+      "when": { "upscale": "1" },
+      "choices": [
+        { "label": "No limit", "set": { "fgtarget": "0" } },
+        { "label": "50 FPS", "set": { "fgtarget": "1" } },
+        { "label": "60 FPS", "set": { "fgtarget": "2" } },
+        { "label": "90 FPS", "set": { "fgtarget": "3" } },
+        { "label": "120 FPS", "set": { "fgtarget": "4" } },
+        { "label": "144 FPS", "set": { "fgtarget": "5" } },
+        { "label": "165 FPS", "set": { "fgtarget": "6" } }
+      ],
+      "defaults": { "fgtarget": "2" }
+    },
+    {
+      "id": "fsr-framegen",
+      "label": "AMD FSR Frame Generation",
+      "help": "2x frame generation on any graphics card through AMD FSR SDK 2.4 (off while NVIDIA Frame Generation is on).",
+      "group": "Upscaling and frame generation",
+      "choices": [
+        { "label": "Off", "set": { "fsrfg": "false" } },
+        { "label": "On (2x)", "set": { "fsrfg": "true" } }
+      ],
+      "defaults": { "fsrfg": "false" }
+    },
+    {
+      "id": "reflex",
+      "label": "NVIDIA Reflex",
+      "help": "Lower input delay on NVIDIA RTX cards.",
+      "group": "Upscaling and frame generation",
+      "choices": [
+        { "label": "Off", "set": { "lowlatency": "false" } },
+        { "label": "On", "set": { "lowlatency": "true" } }
+      ],
+      "defaults": { "lowlatency": "false" }
+    },
+    {
+      "id": "dualsense-speaker",
+      "label": "DualSense speaker",
+      "help": "Play the game's controller sound effects through the DualSense built-in speaker.",
+      "group": "Controls",
+      "choices": [
+        { "label": "On", "set": { "dsSpeaker": "true" } },
+        { "label": "Off", "set": { "dsSpeaker": "false" } }
+      ],
+      "defaults": { "dsSpeaker": "true" }
+    },
+    {
+      "id": "trigger-strength",
+      "label": "Adaptive trigger strength",
+      "help": "DualSense adaptive trigger resistance and vibration in percent (0 = off, 100 = game default).",
+      "group": "Controls",
+      "slider": { "key": "triggerStrength", "min": 0, "max": 100, "step": 10, "format": "%.0f" },
+      "defaults": { "triggerStrength": "100" }
+    },
+    {
+      "id": "vibration",
+      "label": "Vibration strength",
+      "help": "Rumble strength in percent for Xbox, Switch Pro and generic controllers (DualSense keeps its own haptics).",
+      "group": "Controls",
+      "slider": { "key": "rumblepct", "min": 0, "max": 200, "step": 10, "format": "%.0f" },
+      "defaults": { "rumblepct": "70" }
+    },
+    {
+      "id": "tilt-toggle",
+      "label": "Right-stick tilt mode",
+      "help": "For non-gyro pads (Xbox/generic): hold View/Back to tilt with the right stick, or press once to toggle.",
+      "group": "Controls",
+      "choices": [
+        { "label": "Hold View/Back", "set": { "tiltToggle": "false" } },
+        { "label": "Toggle View/Back", "set": { "tiltToggle": "true" } }
+      ],
+      "defaults": { "tiltToggle": "false" }
+    },
+    {
+      "id": "overlay",
+      "label": "Performance overlay",
+      "help": "F2 shows or hides it in game.",
+      "group": "Advanced",
+      "choices": [
+        { "label": "Off", "set": { "overlay": "0" } },
+        { "label": "FPS only", "set": { "overlay": "1" } },
+        { "label": "FPS, CPU, GPU and memory", "set": { "overlay": "2" } },
+        { "label": "Everything", "set": { "overlay": "3" } }
+      ],
+      "defaults": { "overlay": "0" }
+    },
+    {
+      "id": "language",
+      "label": "Game language",
+      "help": "Follow Windows automatically or pick a console language.",
+      "group": "Advanced",
+      "choices": [
+        { "label": "Follow Windows", "set": { "language": "-1" } },
+        { "label": "English (US)", "set": { "language": "1" } },
+        { "label": "English (UK)", "set": { "language": "18" } },
+        { "label": "Japanese", "set": { "language": "0" } },
+        { "label": "French", "set": { "language": "2" } },
+        { "label": "Spanish", "set": { "language": "3" } },
+        { "label": "German", "set": { "language": "4" } },
+        { "label": "Italian", "set": { "language": "5" } },
+        { "label": "Portuguese (BR)", "set": { "language": "17" } },
+        { "label": "Korean", "set": { "language": "9" } },
+        { "label": "Chinese (Simplified)", "set": { "language": "11" } },
+        { "label": "Chinese (Traditional)", "set": { "language": "10" } },
+        { "label": "Russian", "set": { "language": "8" } },
+        { "label": "Polish", "set": { "language": "16" } },
+        { "label": "Arabic", "set": { "language": "21" } }
+      ],
+      "defaults": { "language": "-1" }
+    }
+  ],
+  "groups": [{ "id": "Advanced", "advanced": true }],
+  "saves": [
+    "{install}/Build/RunHybrid/_sd",
+    "{install}/Build/RunHybrid/_sd_mem",
+    "{install}/Build/RunHybrid/_trophy",
+    "{install}/Build/astrohybrid-settings.json"
+  ],
+  "folders": {
+    "logs": [{ "path": "{install}/Logs" }],
+    "mods": [{ "path": "{install}/mods" }]
+  },
+  "exit_codes": {
+    "0": "ok",
+    "321": "The graphics card was reset during play (error 321). Update to the latest AstroHybrid; at 4K on an 8 GB card, use 2560 x 1440. If it keeps happening, send the logs from the game's page.",
+    "-1073740791": "The game stopped after a fatal error (0xC0000409). Make sure you are on the latest AstroHybrid and send hybrid-run.err.log + hybrid-run.out.log from the game's page.",
+    "-1073741819": "Memory access violation (0xC0000005). Update to the latest AstroHybrid, verify your PS5 dump is complete, and send hybrid-run.err.log + hybrid-run.out.log if it repeats."
+  },
+  "system": {
+    "windows": { "version": "10", "graphics": { "vulkan": "1.3" } }
+  }
+}

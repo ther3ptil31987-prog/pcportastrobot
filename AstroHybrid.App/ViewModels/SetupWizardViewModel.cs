@@ -129,16 +129,17 @@ namespace AstroHybrid.App.ViewModels
 
         private void BrowseForGameFolder()
         {
-            var dialog = new System.Windows.Forms.FolderBrowserDialog
+            using (var dialog = new System.Windows.Forms.FolderBrowserDialog
             {
                 Description = "Select your Astro Bot PS5 game dump folder (containing eboot.bin)",
                 ShowNewFolderButton = false
-            };
-
-            if (dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK)
+            })
             {
-                GameDumpPath = dialog.SelectedPath;
-                ValidateCommand.Execute(null);
+                if (dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK)
+                {
+                    GameDumpPath = dialog.SelectedPath;
+                    ValidateCommand.Execute(null);
+                }
             }
         }
 
@@ -164,6 +165,8 @@ namespace AstroHybrid.App.ViewModels
                     StatusMessage = "Game dump validated successfully!";
                     ProgressPercent = 100;
                     CanProceed = true;
+                    if (!string.IsNullOrEmpty(info.Warning))
+                        MessageBox.Show(info.Warning, "AstroHybrid - Game version", MessageBoxButton.OK, MessageBoxImage.Warning);
                 }
                 else
                 {

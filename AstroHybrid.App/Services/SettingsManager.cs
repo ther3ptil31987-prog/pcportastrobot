@@ -26,25 +26,31 @@ namespace AstroHybrid.App.Services
             if (_cachedSettings != null)
                 return _cachedSettings;
 
-            if (File.Exists(_settingsPath))
+            var parsed = TryLoadFile(_settingsPath) ?? TryLoadFile(_settingsPath + ".bak");
+            if (parsed != null)
             {
-                try
-                {
-                    var json = File.ReadAllText(_settingsPath);
-                    _cachedSettings = JsonSerializer.Deserialize<AppSettings>(json, _jsonOptions) ?? new AppSettings();
-                    // Older files only have the preset index ("rumble"); make the percent explicit.
-                    _cachedSettings.NormalizeRumble();
-                    return _cachedSettings;
-                }
-                catch
-                {
-                    _cachedSettings = new AppSettings();
-                    return _cachedSettings;
-                }
+                parsed.NormalizeRumble();
+                _cachedSettings = parsed;
+                return _cachedSettings;
             }
 
             _cachedSettings = new AppSettings();
             return _cachedSettings;
+        }
+
+        private AppSettings? TryLoadFile(string path)
+        {
+            if (!File.Exists(path)) return null;
+            try
+            {
+                var json = File.ReadAllText(path);
+                if (string.IsNullOrWhiteSpace(json)) return null;
+                return JsonSerializer.Deserialize<AppSettings>(json, _jsonOptions);
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         public void Save(AppSettings settings)
@@ -57,7 +63,17 @@ namespace AstroHybrid.App.Services
             }
 
             var json = JsonSerializer.Serialize(settings, _jsonOptions);
-            File.WriteAllText(_settingsPath, json);
+            var tempPath = _settingsPath + ".tmp";
+            var backupPath = _settingsPath + ".bak";
+            File.WriteAllText(tempPath, json);
+            if (File.Exists(_settingsPath))
+            {
+                File.Replace(tempPath, _settingsPath, backupPath, ignoreMetadataErrors: true);
+            }
+            else
+            {
+                File.Move(tempPath, _settingsPath);
+            }
         }
 
         public string GetSettingsPath() => _settingsPath;

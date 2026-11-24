@@ -105,6 +105,7 @@ namespace AstroHybrid.App.Models
     {
         public bool UpdateAvailable { get; set; }
         public UpdateInfo? LatestUpdate { get; set; }
+        public UpdateInfo? IgnoredUpdate { get; set; }
         public string CurrentVersion { get; set; } = "";
         public DateTime LastCheckTime { get; set; }
         public string? IgnoredVersion { get; set; }
@@ -114,5 +115,14 @@ namespace AstroHybrid.App.Models
         public string DownloadStatus { get; set; } = "";
         public bool IsDownloading { get; set; }
         public bool IsInstalling { get; set; }
+        // The update is downloaded and unpacked; restarting the launcher puts it in place.
+        public bool IsReadyToRestart { get; set; }
+
+        // For the progress bar (0-100); DownloadProgress is 0-1.
+        public double DownloadPercent => DownloadProgress * 100.0;
+        public bool IsBusy => IsDownloading || IsInstalling;
+        public bool ShowUpdateButton => !IsBusy && !IsReadyToRestart;
+        // The update line under the banner: progress, "ready to restart" or an error.
+        public bool ShowUpdateStatus => IsBusy || IsReadyToRestart || (!string.IsNullOrEmpty(ErrorMessage) && !string.IsNullOrEmpty(DownloadStatus));
     }
 }

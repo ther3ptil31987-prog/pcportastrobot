@@ -1,0 +1,59 @@
+From 5c8d1f28e2e00d7048ca5edb6f4e73d44b59f482 Mon Sep 17 00:00:00 2001
+From: Local Build <local@invalid>
+Date: Mon, 23 Nov 2026 18:19:08 +0000
+Subject: [PATCH] fix(shader): enable uniformBufferStandardLayout in spirv-val
+ for KYTY_FUNCTION_ARRAY_SHRINK
+
+---
+ src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp | 3 +++
+ src/graphics/host_gpu/vulkanCommon.cpp                    | 6 +++++-
+ 2 files changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+index fd463631..e6a21a25 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+@@ -28,6 +28,7 @@
+ #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+ #include "graphics/host_gpu/renderer/pipeline/pipelineLayoutCache.h"
+ #include "graphics/host_gpu/renderer/pipeline/pipelineFastFirst.h"
++#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+ #include "graphics/host_gpu/renderer/pipeline/pipelineStats.h"
+ #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
+ #include "graphics/host_gpu/renderer/pipeline/pipelineList.h"
+@@ -1400,6 +1401,8 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
+ 	});
+ 	spvtools::ValidatorOptions validator_options;
+ 	validator_options.SetAllowOffsetTextureOperand(maintenance8_enabled);
++	validator_options.SetUniformBufferStandardLayout(
++	    ShaderRecompiler::Spirv::GetHostBufferRobustness().uniform_dword_loads_return_zero);
+ 	if (tools.Validate(spirv.data(), spirv.size(), validator_options)) {
+ 		return true;
+ 	}
+diff --git a/src/graphics/host_gpu/vulkanCommon.cpp b/src/graphics/host_gpu/vulkanCommon.cpp
+index 35a26c3e..3bc6766d 100644
+--- a/src/graphics/host_gpu/vulkanCommon.cpp
++++ b/src/graphics/host_gpu/vulkanCommon.cpp
+@@ -9,6 +9,7 @@
+ #include "graphics/host_gpu/graphicContext.h"
+ #include "graphics/host_gpu/spirvLocalArrays.h"
+ #include "graphics/host_gpu/vramStats.h"
++#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+ 
+ #include <spirv-tools/libspirv.hpp>
+ 
+@@ -220,7 +221,10 @@ std::vector<uint32_t> ShrinkFunctionArrays(std::span<const uint32_t> code, uint6
+ 			messages += "; ";
+ 		}
+ 	});
+-	const bool valid = tools.Validate(shrunk);
++	spvtools::ValidatorOptions validator_options;
++	validator_options.SetUniformBufferStandardLayout(
++	    ShaderRecompiler::Spirv::GetHostBufferRobustness().uniform_dword_loads_return_zero);
++	const bool valid = tools.Validate(shrunk.data(), shrunk.size(), validator_options);
+ 	static std::mutex                   log_mutex;
+ 	static std::set<std::string>        logged;
+ 	std::string                         arrays;
+-- 
+2.55.0.windows.5
+

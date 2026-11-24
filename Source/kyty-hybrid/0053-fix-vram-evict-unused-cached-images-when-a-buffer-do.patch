@@ -1,0 +1,191 @@
+From b52f7104631ffcf94562f1868bcd426567b8dc43 Mon Sep 17 00:00:00 2001
+From: Codex <local@invalid>
+Date: Sat, 21 Nov 2026 18:46:55 +0000
+Subject: [PATCH] fix(vram): evict unused cached images when a buffer does not
+ fit video memory
+
+pcportastrobot #155, #170 (exit 321): at 4K on 8 GB cards a 270-310 MB buffer was refused in video
+memory and then in system memory (16 GB PCs where the game already uses about 12 GB), and the game
+ended. The budget collector runs once per frame and aims at three quarters of the budget, so nothing
+gave room back when the allocation happened. GraphicContext::relieve_memory_pressure, set by the
+texture cache, now frees clean images unused for two frames or more, oldest first, up to 1.5x the
+request, and the allocation is retried in video memory before going past the budget or to system
+memory. It takes the cache lock with a new TrackingSpinLock::try_lock and does nothing when the lock is
+held (by this thread or another), so it never deadlocks or re-enters the cache.
+KYTY_DEBUG_FAIL_BUFFER_ALLOC_AFTER=M (test) delays the forced failures of KYTY_DEBUG_FAIL_BUFFER_ALLOC
+until M video-memory buffer allocations, so they can be exercised in play.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/graphics/host_gpu/graphicContext.h        |  5 ++++
+ src/graphics/host_gpu/regionManager.h         |  9 +++++++
+ .../host_gpu/renderer/cache/streamBuffer.cpp  | 27 ++++++++++++++++---
+ .../host_gpu/renderer/cache/textureCache.cpp  | 23 ++++++++++++++++
+ .../host_gpu/renderer/cache/textureCache.h    |  2 ++
+ 5 files changed, 63 insertions(+), 3 deletions(-)
+
+diff --git a/src/graphics/host_gpu/graphicContext.h b/src/graphics/host_gpu/graphicContext.h
+index 1f042b33..e93a4518 100644
+--- a/src/graphics/host_gpu/graphicContext.h
++++ b/src/graphics/host_gpu/graphicContext.h
+@@ -11,6 +11,7 @@
+ #include <atomic>
+ #include <chrono>
+ #include <cstdint>
++#include <functional>
+ #include <map>
+ #include <memory>
+ #include <mutex>
+@@ -245,6 +246,10 @@ struct GraphicContext {
+ 	// An allocation failed for lack of device memory: destroys what is only retained for reuse
+ 	// (the native image pool) before the caller retries. Returns the bytes released.
+ 	uint64_t               ReleaseRetainedMemory();
++	// Set by the texture cache: frees cached images not used for a few frames, up to the given bytes,
++	// when an allocation failed for lack of device memory (streamBuffer.cpp). Returns the bytes freed
++	// (0 when the cache is busy on this or another thread). Empty while no texture cache exists.
++	std::function<uint64_t(uint64_t)> relieve_memory_pressure;
+ 	// KYTY_TEXTURE_SPARSE_RESIDENCY (sparse_residency_image_enabled): creates `info` as a sparse
+ 	// residency image with memory bound behind levels >= first_level only (a single-layer,
+ 	// single-sample 2D image whose format, usage and flags support sparse residency; false and
+diff --git a/src/graphics/host_gpu/regionManager.h b/src/graphics/host_gpu/regionManager.h
+index becac0f0..36331355 100644
+--- a/src/graphics/host_gpu/regionManager.h
++++ b/src/graphics/host_gpu/regionManager.h
+@@ -53,6 +53,15 @@ public:
+ 		}
+ 		m_owner.store(thread, std::memory_order_relaxed);
+ 	}
++	// False, without waiting, when another thread holds the lock or this thread already does.
++	[[nodiscard]] bool try_lock() noexcept {
++		const auto thread = CurrentThread();
++		if (m_owner.load(std::memory_order_relaxed) == thread || !m_lock.try_lock()) {
++			return false;
++		}
++		m_owner.store(thread, std::memory_order_relaxed);
++		return true;
++	}
+ 	void unlock() noexcept {
+ 		if (m_owner.load(std::memory_order_relaxed) != CurrentThread()) {
+ 			EXIT("region tracking lock released by non-owner\n");
+diff --git a/src/graphics/host_gpu/renderer/cache/streamBuffer.cpp b/src/graphics/host_gpu/renderer/cache/streamBuffer.cpp
+index 72f43b4a..ee300cdd 100644
+--- a/src/graphics/host_gpu/renderer/cache/streamBuffer.cpp
++++ b/src/graphics/host_gpu/renderer/cache/streamBuffer.cpp
+@@ -141,12 +141,23 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
+ 		const auto* value = std::getenv("KYTY_DEBUG_FAIL_BUFFER_ALLOC");
+ 		return value != nullptr ? std::strtoll(value, nullptr, 10) : int64_t {0};
+ 	}()};
++	// KYTY_DEBUG_FAIL_BUFFER_ALLOC_AFTER=M (test): those failures start only after M video-memory
++	// buffer allocations, so they happen in play, when the texture cache holds images it can evict.
++	static std::atomic<int64_t> debug_fail_after {[] {
++		const auto* value = std::getenv("KYTY_DEBUG_FAIL_BUFFER_ALLOC_AFTER");
++		return value != nullptr ? std::strtoll(value, nullptr, 10) : int64_t {0};
++	}()};
+ 	const auto create = [&] {
+ 		if (allocation_info.usage != VMA_MEMORY_USAGE_AUTO_PREFER_HOST &&
++		    debug_fail_after.load(std::memory_order_relaxed) <= 0 &&
+ 		    debug_fail_remaining.load(std::memory_order_relaxed) > 0 &&
+ 		    debug_fail_remaining.fetch_sub(1, std::memory_order_relaxed) > 0) {
+ 			return vk::Result::eErrorOutOfDeviceMemory;
+ 		}
++		if (allocation_info.usage != VMA_MEMORY_USAGE_AUTO_PREFER_HOST &&
++		    debug_fail_after.load(std::memory_order_relaxed) > 0) {
++			debug_fail_after.fetch_sub(1, std::memory_order_relaxed);
++		}
+ 		return static_cast<vk::Result>(vmaCreateBuffer(
+ 		    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
+ 		    &native_buffer, &m_allocation, &allocation_result));
+@@ -159,6 +170,16 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
+ 		graphics.LogMemoryBudget();
+ 		const auto released = graphics.ReleaseRetainedMemory();
+ 		result              = create();
++		uint64_t evicted    = 0;
++		if (result != vk::Result::eSuccess && graphics.relieve_memory_pressure) {
++			// Free unused cached images now (TextureCache::RelieveMemoryPressure), then retry in video
++			// memory before going past the budget or to system memory.
++			evicted = graphics.relieve_memory_pressure(size + size / 2);
++			if (evicted != 0) {
++				(void)graphics.ReleaseRetainedMemory();
++				result = create();
++			}
++		}
+ 		bool over_budget    = false;
+ 		bool system_memory  = false;
+ 		if (result != vk::Result::eSuccess) {
+@@ -182,9 +203,9 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
+ 		static std::atomic<uint32_t> reported {0};
+ 		if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+ 			Log::WriteToConsoleAndLog(fmt::format(
+-			    "Kyty VRAM: a {}-byte buffer did not fit the memory budget; released {} retained bytes "
+-			    "and retried: {}\n",
+-			    size, released,
++			    "Kyty VRAM: a {}-byte buffer did not fit the memory budget; released {} retained bytes, "
++			    "evicted {} bytes of unused images and retried: {}\n",
++			    size, released, evicted,
+ 			    result != vk::Result::eSuccess
+ 			        ? vk::to_string(result)
+ 			        : std::string(system_memory ? "created in system memory (slower)"
+diff --git a/src/graphics/host_gpu/renderer/cache/textureCache.cpp b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
+index aa95affc..1f1c9601 100644
+--- a/src/graphics/host_gpu/renderer/cache/textureCache.cpp
++++ b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
+@@ -400,6 +400,7 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
+       m_buffer_cache(buffer_cache),
+       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()),
+       m_readback_tiled_images(Config::ReadbackTiledImagesEnabled()) {
++	m_graphics.relieve_memory_pressure = [this](uint64_t bytes) { return RelieveMemoryPressure(bytes); };
+ 	m_image_page_counts = std::make_unique<std::atomic<uint32_t>[]>(
+ 	    size_t {1} << (ImagePageTable::kAddressSpaceBits - ImagePageTable::kPageBits));
+ 	m_fault_fast_path = EnvNotZero("KYTY_TEXTURE_FAULT_FAST_PATH");
+@@ -629,6 +630,7 @@ StreamBuffer& TextureCache::StagingRing() {
+ }
+ 
+ TextureCache::~TextureCache() {
++	m_graphics.relieve_memory_pressure = nullptr;
+ 	if (m_staging_copier) {
+ 		// The scheduler has drained by now; no later submission may wait on the copier.
+ 		m_scheduler.SetSubmitDependency(nullptr);
+@@ -6633,6 +6635,27 @@ bool TextureCache::KeptIdlePool(const Image& image) const {
+ 	return big_budget;
+ }
+ 
++// An allocation found video memory full (pcportastrobot #155, #170: a 270-310 MB buffer at 4K on an
++// 8 GB card, refused in video memory and then in system memory, ended the game with 321). The budget
++// collector runs once per frame and aims at three quarters of the budget, so nothing gave the room
++// back at once: free clean images unused for two frames or more, oldest first, now. Skipped (0) when
++// the cache lock is held, by this thread (the allocation happens inside the cache) or another one.
++uint64_t TextureCache::RelieveMemoryPressure(uint64_t bytes) {
++	if (!m_lock.try_lock()) {
++		return 0;
++	}
++	const auto freed = RetireUnusedImages(m_frame.load(std::memory_order_relaxed), 2, 4096, bytes);
++	m_lock.unlock();
++	if (freed != 0) {
++		static std::atomic<uint32_t> reported {0};
++		if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
++			std::printf("Kyty VRAM: evicted %" PRIu64 " MiB of unused images to make room\n", freed >> 20u);
++			std::fflush(stdout);
++		}
++	}
++	return freed;
++}
++
+ uint64_t TextureCache::RetireUnusedImages(uint64_t frame, uint64_t min_age, size_t max_count,
+                                           uint64_t enough, bool idle_pass) {
+ 	if (frame <= min_age) {
+diff --git a/src/graphics/host_gpu/renderer/cache/textureCache.h b/src/graphics/host_gpu/renderer/cache/textureCache.h
+index 3ca9f640..8500d76c 100644
+--- a/src/graphics/host_gpu/renderer/cache/textureCache.h
++++ b/src/graphics/host_gpu/renderer/cache/textureCache.h
+@@ -219,6 +219,8 @@ public:
+ 	// The image of a slot id, or nullptr when the slot is free (GPU thread).
+ 	[[nodiscard]] Image* TryGetImage(ImageId id) noexcept { return m_slot_images.try_get(id); }
+ 	void RunGarbageCollector();
++	// GraphicContext::relieve_memory_pressure: images unused for 2+ frames, oldest first, up to `bytes`.
++	uint64_t RelieveMemoryPressure(uint64_t bytes);
+ 	// KYTY_VRAM_STATS report lines (vramStats.h): images by binding kind, frame age, residency,
+ 	// render-target sizes and aliases, the largest images, the GC thresholds (GPU thread).
+ 	void ReportVram();
+-- 
+2.55.0.windows.5
+

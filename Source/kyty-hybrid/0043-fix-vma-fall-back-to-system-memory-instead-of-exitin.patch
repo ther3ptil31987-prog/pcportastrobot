@@ -1,0 +1,216 @@
+From 88d25bc29b1c274f9e4c76b6dedb4340ba578d09 Mon Sep 17 00:00:00 2001
+From: Local Build <local@invalid>
+Date: Wed, 18 Nov 2026 14:08:58 +0000
+Subject: fix(vma): fall back to system memory instead of exiting when video
+ memory is full
+
+Sparse residency binds required DEVICE_LOCAL memory and ended the process at
+"allocate sparse image memory failed: ErrorOutOfDeviceMemory" (pcportastrobot
+#107). Ordinary images only fell back on eErrorOutOfDeviceMemory, so a driver
+that reports a full heap another way ended at "failed to create image" (#6).
+
+- BindSparseImageLevels: release retained images and retry, then allocate in
+  any memory type the image allows (KYTY_IMAGE_SYSMEM_FALLBACK). Returns false
+  when nothing fits; the initial bind then undoes the sparse image so
+  CreateImage makes an ordinary one, and later binds keep the current levels.
+- CreateImage: the retries apply to every memory failure (out of device/host
+  memory, fragmentation), and a final failure logs its vk::Result.
+- KYTY_DEBUG_FAIL_SPARSE_ALLOC / KYTY_DEBUG_FAIL_IMAGE_ALLOC=N make the first N
+  video-memory allocations fail, to test these paths.
+---
+ src/graphics/host_gpu/graphicContext.h |  8 ++-
+ src/graphics/host_gpu/vma.cpp          | 92 +++++++++++++++++++++++---
+ 2 files changed, 90 insertions(+), 10 deletions(-)
+
+diff --git a/src/graphics/host_gpu/graphicContext.h b/src/graphics/host_gpu/graphicContext.h
+index ed299289..1f042b33 100644
+--- a/src/graphics/host_gpu/graphicContext.h
++++ b/src/graphics/host_gpu/graphicContext.h
+@@ -261,7 +261,10 @@ struct GraphicContext {
+ 	// because sampled views span non-resident levels) access the levels being bound.
+ 	[[nodiscard]] bool     CreateSparseImage(const vk::ImageCreateInfo& info, uint32_t first_level,
+ 	                                         VulkanImage& image);
+-	void                   BindSparseImageLevels(VulkanImage& image, uint32_t first_level,
++	// Out of video memory, the bind retries after releasing retained images and then in any memory
++	// type the image allows (KYTY_IMAGE_SYSMEM_FALLBACK). False when no memory was found: nothing
++	// was bound and the image keeps its current levels.
++	bool                   BindSparseImageLevels(VulkanImage& image, uint32_t first_level,
+ 	                                             vk::Semaphore wait_semaphore = nullptr,
+ 	                                             uint64_t      wait_value     = 0);
+ 	// The timeline semaphore image binds signal, and the newest value signalled by a bind that may
+@@ -345,6 +348,9 @@ struct VulkanImage {
+ 		uint64_t                   block_size       = 0;
+ 		uint32_t                   memory_type_bits = 0;
+ 		uint64_t                   bytes            = 0;
++		// No memory could be found for a later bind (video and system memory full): the image keeps
++		// the levels it has and no further bind is tried for it.
++		bool                       bind_failed      = false;
+ 		std::vector<VmaAllocation> allocations;
+ 	};
+ 	std::unique_ptr<SparseState> sparse;
+diff --git a/src/graphics/host_gpu/vma.cpp b/src/graphics/host_gpu/vma.cpp
+index a1bd8541..d4004bb8 100644
+--- a/src/graphics/host_gpu/vma.cpp
++++ b/src/graphics/host_gpu/vma.cpp
+@@ -416,7 +416,14 @@ bool GraphicContext::CreateSparseImage(const vk::ImageCreateInfo& info, uint32_t
+ 	image.subresource_states.clear();
+ 	image.pool_eligible    = false;
+ 	image.pool_create_info = vk::ImageCreateInfo {};
+-	BindSparseImageLevels(image, first_level);
++	if (!BindSparseImageLevels(image, first_level)) {
++		// No memory at all for the resident levels: undo, so the caller makes an ordinary image
++		// (CreateImage has its own system-memory fallback) instead of a sparse one.
++		device.destroyImage(native, nullptr);
++		image.image = nullptr;
++		image.sparse.reset();
++		return false;
++	}
+ 	if (HangTrace::Enabled()) {
+ 		HangTrace::RecordNativeImage(true, false, static_cast<uint32_t>(sparse_info.format),
+ 		                             sparse_info.extent.width, sparse_info.extent.height,
+@@ -456,14 +463,36 @@ void GraphicContext::WaitSparseBinds() {
+ 	RequireVulkanSuccess(device.waitSemaphores(&wait, UINT64_MAX), "wait for sparse image binds");
+ }
+ 
+-void GraphicContext::BindSparseImageLevels(VulkanImage& image, uint32_t first_level,
++// KYTY_DEBUG_FAIL_SPARSE_ALLOC=N / KYTY_DEBUG_FAIL_IMAGE_ALLOC=N: the first N video-memory
++// allocations of that kind fail as if video memory were full (tests the fallbacks below).
++static int64_t DebugFailCount(const char* name) {
++	const auto* value = std::getenv(name);
++	return value != nullptr ? std::strtoll(value, nullptr, 10) : 0;
++}
++
++static bool DebugFailSparseAllocation() {
++	static std::atomic<int64_t> remaining {DebugFailCount("KYTY_DEBUG_FAIL_SPARSE_ALLOC")};
++	return remaining.load(std::memory_order_relaxed) > 0 &&
++	       remaining.fetch_sub(1, std::memory_order_relaxed) > 0;
++}
++
++static bool DebugFailImageAllocation() {
++	static std::atomic<int64_t> remaining {DebugFailCount("KYTY_DEBUG_FAIL_IMAGE_ALLOC")};
++	return remaining.load(std::memory_order_relaxed) > 0 &&
++	       remaining.fetch_sub(1, std::memory_order_relaxed) > 0;
++}
++
++bool GraphicContext::BindSparseImageLevels(VulkanImage& image, uint32_t first_level,
+                                            vk::Semaphore wait_semaphore, uint64_t wait_value) {
+ 	EXIT_IF(!image.sparse || image.image == nullptr);
+ 	auto&      state  = *image.sparse;
+ 	const auto levels = image.mip_levels;
+ 	const auto first  = std::min(first_level, levels - 1);
+ 	if (first >= state.first_bound) {
+-		return;
++		return true;
++	}
++	if (state.bind_failed) {
++		return false;
+ 	}
+ 	// New levels: [first, end). Levels from tail_first on live in the mip tail, bound as a whole.
+ 	const auto end        = std::min(state.first_bound, levels);
+@@ -487,7 +516,7 @@ void GraphicContext::BindSparseImageLevels(VulkanImage& image, uint32_t first_le
+ 	bytes += tail_bytes;
+ 	if (bytes == 0) {
+ 		state.first_bound = first;
+-		return;
++		return true;
+ 	}
+ 	VkMemoryRequirements requirements {};
+ 	requirements.size           = bytes;
+@@ -497,9 +526,39 @@ void GraphicContext::BindSparseImageLevels(VulkanImage& image, uint32_t first_le
+ 	create.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+ 	VmaAllocation     allocation = nullptr;
+ 	VmaAllocationInfo info {};
+-	RequireVulkanSuccess(static_cast<vk::Result>(
+-	                         vmaAllocateMemory(allocator, &requirements, &create, &allocation, &info)),
+-	                     "allocate sparse image memory");
++	auto allocate = [&] {
++		if (create.requiredFlags != 0 && DebugFailSparseAllocation()) {
++			return vk::Result::eErrorOutOfDeviceMemory;
++		}
++		return static_cast<vk::Result>(vmaAllocateMemory(allocator, &requirements, &create, &allocation, &info));
++	};
++	auto result = allocate();
++	if (result != vk::Result::eSuccess) {
++		// Out of video memory (#107: "allocate sparse image memory failed: ErrorOutOfDeviceMemory"
++		// ended the game). Same policy as CreateImage: drop retained images and retry, then accept
++		// any memory type the image allows (system memory: slower to sample, but the game goes on).
++		ReleaseRetainedMemory();
++		result = allocate();
++		if (result != vk::Result::eSuccess && ImageSystemMemoryFallbackEnabled()) {
++			create.requiredFlags  = 0;
++			create.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
++			result                = allocate();
++		}
++		static std::atomic<uint32_t> reported {0};
++		if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
++			std::fprintf(stderr,
++			             "Vulkan: video memory full, %s: %ux%u levels %u-%u, %llu bytes (%s; KYTY_IMAGE_SYSMEM_FALLBACK)\n",
++			             result == vk::Result::eSuccess ? "sparse image levels are in system memory"
++			                                            : "sparse image levels stay unbound",
++			             image.extent.width, image.extent.height, first, end - 1,
++			             static_cast<unsigned long long>(bytes), vk::to_string(result).c_str());
++			LogMemoryBudget();
++		}
++		if (result != vk::Result::eSuccess) {
++			state.bind_failed = true;
++			return false;
++		}
++	}
+ 	EXIT_IF(info.offset % state.block_size != 0);
+ 	uint64_t offset = info.offset;
+ 	for (uint32_t level = first; level < std::min(end, tail_first); ++level) {
+@@ -568,6 +627,7 @@ void GraphicContext::BindSparseImageLevels(VulkanImage& image, uint32_t first_le
+ 	state.first_bound = first;
+ 	state.tail_bound |= need_tail;
+ 	VramStats::Note(VramStats::Kind::Image, true, static_cast<int64_t>(bytes));
++	return true;
+ }
+ 
+ void GraphicContext::ClearRetiredImages() {
+@@ -809,6 +869,9 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
+ 		VmaAllocationCreateInfo alloc_info {};
+ 		alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+ 		auto allocate = [&] {
++			if (alloc_info.requiredFlags != 0 && DebugFailImageAllocation()) {
++				return vk::Result::eErrorOutOfDeviceMemory;
++			}
+ 			Profiler::ScopedFrameWait timing(Profiler::FrameWait::NativeImageCreate);
+ 			vk::Image::CType native_image = VK_NULL_HANDLE;
+ 			VmaAllocation allocation = nullptr;
+@@ -821,13 +884,20 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
+ 			}
+ 			return result;
+ 		};
++		// Every memory failure gets the retries, not only eErrorOutOfDeviceMemory: an AMD 8 GB card
++		// ended at "failed to create image" without the out-of-video-memory message (#6), so the
++		// driver reported the full heap another way.
++		const auto memory_failure = [](vk::Result r) {
++			return r == vk::Result::eErrorOutOfDeviceMemory || r == vk::Result::eErrorOutOfHostMemory ||
++			       r == vk::Result::eErrorFragmentedPool || r == vk::Result::eErrorFragmentation;
++		};
+ 		auto result = allocate();
+-		if (result == vk::Result::eErrorOutOfDeviceMemory && NativeImagePoolEnabled()) {
++		if (memory_failure(result) && NativeImagePoolEnabled()) {
+ 			// Retained objects are optional. Release them before one allocation retry.
+ 			ClearRetiredImages();
+ 			result = allocate();
+ 		}
+-		if (result == vk::Result::eErrorOutOfDeviceMemory && ImageSystemMemoryFallbackEnabled()) {
++		if (memory_failure(result) && ImageSystemMemoryFallbackEnabled()) {
+ 			// From chenxiao07/KytyPS5 86910c0d2: out of video memory, the image goes to any memory
+ 			// type the driver allows for it (NVIDIA: system memory for optimal images). Slower to
+ 			// sample, but the game goes on instead of ending at "failed to create image".
+@@ -847,6 +917,10 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
+ 			}
+ 		}
+ 		if (result != vk::Result::eSuccess) {
++			std::fprintf(stderr, "Vulkan: image creation failed with %s: %ux%ux%u format=%d layers=%u levels=%u\n",
++			             vk::to_string(result).c_str(), image_info.extent.width, image_info.extent.height,
++			             image_info.extent.depth, static_cast<int>(image_info.format),
++			             image_info.arrayLayers, image_info.mipLevels);
+ 			LogMemoryBudget();
+ 			return false;
+ 		}
+-- 
+2.55.0.windows.5
+

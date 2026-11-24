@@ -1,0 +1,162 @@
+From 0a3d236d5bfab631a3e0ad3f20819aa2f4ba9a3b Mon Sep 17 00:00:00 2001
+From: Local Build <local@invalid>
+Date: Mon, 23 Nov 2026 18:40:09 +0000
+Subject: [PATCH] fix(stability): add 250ms VRAM allocation cooldown and
+ absurd-draw guard
+
+---
+ src/graphics/host_gpu/renderer/renderDraw.cpp | 20 ++++++-
+ src/graphics/host_gpu/vma.cpp                 | 57 +++++++++++++++++--
+ 2 files changed, 69 insertions(+), 8 deletions(-)
+
+diff --git a/src/graphics/host_gpu/renderer/renderDraw.cpp b/src/graphics/host_gpu/renderer/renderDraw.cpp
+index 60a28536..506a7166 100644
+--- a/src/graphics/host_gpu/renderer/renderDraw.cpp
++++ b/src/graphics/host_gpu/renderer/renderDraw.cpp
+@@ -3404,6 +3404,20 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
+ 	                  draw.index_count, index_addr);
+ }
+ 
++static bool IsAbsurdDraw(uint32_t count, uint32_t instance_count, const char* kind) {
++	constexpr uint64_t kMaxVertexInvocations = 1ull << 30;
++	const uint64_t     invocations           = static_cast<uint64_t>(count) * instance_count;
++	if (invocations < kMaxVertexInvocations) [[likely]] {
++		return false;
++	}
++	static std::atomic<uint32_t> logged {0};
++	if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
++		std::fprintf(stderr, "Kyty draw guard: dropped absurd %s (%u x %u = %llu invocations)\n",
++		             kind, count, instance_count, static_cast<unsigned long long>(invocations));
++	}
++	return true;
++}
++
+ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, const CommandSink& vk_buffer,
+                                const DrawCallInfo& draw, const DrawEmitInfo& emit) {
+ 	switch (ucfg.GetPrimType()) {
+@@ -4882,7 +4896,8 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
+ 	// KYTY_DRAW_RUN: only a draw that records through the eligible path seeds the next continuation.
+ 	BeginDrawRun();
+ 	CommitStats::StepMark(CommitStats::Step::BeginRun);
+-	if (args.index_count == 0 || args.instance_count == 0) {
++	if (args.index_count == 0 || args.instance_count == 0 ||
++	    IsAbsurdDraw(args.index_count, args.instance_count, "DrawIndex")) {
+ 		return;
+ 	}
+ 
+@@ -5038,7 +5053,8 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
+ 	// KYTY_DRAW_RUN: only a draw that records through the eligible path seeds the next continuation.
+ 	BeginDrawRun();
+ 	CommitStats::StepMark(CommitStats::Step::BeginRun);
+-	if (args.vertex_count == 0 || args.instance_count == 0) {
++	if (args.vertex_count == 0 || args.instance_count == 0 ||
++	    IsAbsurdDraw(args.vertex_count, args.instance_count, "DrawIndexAuto")) {
+ 		return;
+ 	}
+ 
+diff --git a/src/graphics/host_gpu/vma.cpp b/src/graphics/host_gpu/vma.cpp
+index 5a20b176..78645f14 100644
+--- a/src/graphics/host_gpu/vma.cpp
++++ b/src/graphics/host_gpu/vma.cpp
+@@ -101,6 +101,39 @@ static bool ImageSystemMemoryFallbackEnabled() {
+ 	return enabled;
+ }
+ 
++// Short cooldown after an evicted VRAM image allocation still fails: avoids hammering the driver
++// and eviction lock on every texture during a VRAM pressure burst on 6-8 GB cards.
++static std::atomic<int64_t>  g_vram_image_cooldown_until_ns {0};
++static std::atomic<uint64_t> g_vram_image_cooldown_min_bytes {UINT64_MAX};
++
++static int64_t VramSteadyNowNs() {
++	return std::chrono::duration_cast<std::chrono::nanoseconds>(
++	           std::chrono::steady_clock::now().time_since_epoch())
++	    .count();
++}
++
++static bool InVramImageCooldown(uint64_t bytes) {
++	if (!ImageSystemMemoryFallbackEnabled()) return false;
++	const int64_t until = g_vram_image_cooldown_until_ns.load(std::memory_order_relaxed);
++	if (until == 0 || VramSteadyNowNs() >= until) return false;
++	return bytes >= g_vram_image_cooldown_min_bytes.load(std::memory_order_relaxed);
++}
++
++static void RecordVramImageCooldown(uint64_t bytes) {
++	constexpr int64_t kCooldownNs = 250ll * 1000ll * 1000ll;
++	const int64_t     now         = VramSteadyNowNs();
++	const int64_t     prev_until  = g_vram_image_cooldown_until_ns.load(std::memory_order_relaxed);
++	if (now >= prev_until) {
++		g_vram_image_cooldown_min_bytes.store(bytes, std::memory_order_relaxed);
++	} else {
++		uint64_t cur = g_vram_image_cooldown_min_bytes.load(std::memory_order_relaxed);
++		while (bytes < cur && !g_vram_image_cooldown_min_bytes.compare_exchange_weak(
++		                          cur, bytes, std::memory_order_relaxed)) {
++		}
++	}
++	g_vram_image_cooldown_until_ns.store(now + kCooldownNs, std::memory_order_relaxed);
++}
++
+ // KYTY_NATIVE_IMAGE_POOL_IDLE_MS=N (default 0: off): a retained native image that no create has
+ // reused for N ms is destroyed (TrimRetiredImages, from the garbage collector). The pool then holds
+ // what the current churn recycles instead of up to its whole limit of images retired in earlier
+@@ -524,7 +557,12 @@ bool GraphicContext::BindSparseImageLevels(VulkanImage& image, uint32_t first_le
+ 	requirements.alignment      = state.block_size;
+ 	requirements.memoryTypeBits = state.memory_type_bits;
+ 	VmaAllocationCreateInfo create {};
+-	create.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
++	if (InVramImageCooldown(bytes)) {
++		create.requiredFlags  = 0;
++		create.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
++	} else {
++		create.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
++	}
+ 	VmaAllocation     allocation = nullptr;
+ 	VmaAllocationInfo info {};
+ 	auto allocate = [&] {
+@@ -546,6 +584,7 @@ bool GraphicContext::BindSparseImageLevels(VulkanImage& image, uint32_t first_le
+ 			}
+ 		}
+ 		if (result != vk::Result::eSuccess && ImageSystemMemoryFallbackEnabled()) {
++			RecordVramImageCooldown(bytes);
+ 			create.requiredFlags  = 0;
+ 			create.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+ 			result                = allocate();
+@@ -905,6 +944,15 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
+ 			return r == vk::Result::eErrorOutOfDeviceMemory || r == vk::Result::eErrorOutOfHostMemory ||
+ 			       r == vk::Result::eErrorFragmentedPool || r == vk::Result::eErrorFragmentation;
+ 		};
++		const uint64_t est_image_bytes =
++		    static_cast<uint64_t>(image_info.extent.width) * image_info.extent.height *
++		    std::max<uint32_t>(1u, image_info.extent.depth) *
++		    std::max<uint32_t>(1u, image_info.arrayLayers) * 4ull;
++		if (alloc_info.requiredFlags == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT &&
++		    InVramImageCooldown(est_image_bytes)) {
++			alloc_info.requiredFlags  = 0;
++			alloc_info.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
++		}
+ 		auto result = allocate();
+ 		if (memory_failure(result) && NativeImagePoolEnabled()) {
+ 			// Retained objects are optional. Release them before one allocation retry.
+@@ -912,11 +960,7 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
+ 			result = allocate();
+ 		}
+ 		if (memory_failure(result) && relieve_memory_pressure) {
+-			const uint64_t approx_bytes = std::max<uint64_t>(
+-			    64ull * 1024ull * 1024ull,
+-			    static_cast<uint64_t>(image_info.extent.width) * image_info.extent.height *
+-			        std::max<uint32_t>(1u, image_info.extent.depth) *
+-			        std::max<uint32_t>(1u, image_info.arrayLayers) * 4ull);
++			const uint64_t approx_bytes = std::max<uint64_t>(64ull * 1024ull * 1024ull, est_image_bytes);
+ 			if (relieve_memory_pressure(approx_bytes) != 0) {
+ 				result = allocate();
+ 			}
+@@ -925,6 +969,7 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
+ 			// From chenxiao07/KytyPS5 86910c0d2: out of video memory, the image goes to any memory
+ 			// type the driver allows for it (NVIDIA: system memory for optimal images). Slower to
+ 			// sample, but the game goes on instead of ending at "failed to create image".
++			RecordVramImageCooldown(est_image_bytes);
+ 			alloc_info.requiredFlags  = 0;
+ 			alloc_info.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+ 			result                    = allocate();
+-- 
+2.55.0.windows.5
+

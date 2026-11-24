@@ -1,0 +1,88 @@
+From 3d0082611f0576045990a7c1eb4145fe50268ad9 Mon Sep 17 00:00:00 2001
+From: Codex <codex@example.com>
+Date: Fri, 20 Nov 2026 18:43:50 +0000
+Subject: [PATCH] feat(libc): overlay guest files from APS5_PATH_OVERLAYS
+
+APS5_PATH_OVERLAYS=/<guest prefix>=<host folder>[;...]: a regular file below the host folder at the same
+relative path replaces the guest file below the prefix (for example /app0=<mods> for game mods). Missing
+files, directories and modules resolve as before. APS5_PATH_ALIASES now shares the parser.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ core/libs/prx/libc/src/General.cpp | 35 ++++++++++++++++++++++++++----
+ 1 file changed, 31 insertions(+), 4 deletions(-)
+
+diff --git a/core/libs/prx/libc/src/General.cpp b/core/libs/prx/libc/src/General.cpp
+index 6a5e98fd9a..21c5e363ce 100644
+--- a/core/libs/prx/libc/src/General.cpp
++++ b/core/libs/prx/libc/src/General.cpp
+@@ -72,9 +72,10 @@ std::string TrimAliasSlashes(std::string_view text) {
+     return std::string(text.substr(first, last - first));
+ }
+ 
+-void AddEnvironmentAliases(PathAliases& aliases) {
+-    const char* value = std::getenv("APS5_PATH_ALIASES");
+-    if (value == nullptr) return;
++std::vector<std::pair<std::string, std::string>> EnvironmentPathList(const char* name) {
++    std::vector<std::pair<std::string, std::string>> entries;
++    const char* value = std::getenv(name);
++    if (value == nullptr) return entries;
+     std::string_view text(value);
+     while (!text.empty()) {
+         const auto end = text.find(';');
+@@ -83,11 +84,21 @@ void AddEnvironmentAliases(PathAliases& aliases) {
+         if (separator != std::string_view::npos) {
+             auto prefix = TrimAliasSlashes(item.substr(0, separator));
+             std::string host(item.substr(separator + 1));
+-            if (!prefix.empty() && !host.empty()) aliases.entries.emplace_back(std::move(prefix), std::move(host));
++            if (!prefix.empty() && !host.empty()) entries.emplace_back(std::move(prefix), std::move(host));
+         }
+         if (end == std::string_view::npos) break;
+         text.remove_prefix(end + 1);
+     }
++    return entries;
++}
++
++const std::vector<std::pair<std::string, std::string>>& PathOverlays() {
++    static const auto* overlays = new std::vector<std::pair<std::string, std::string>>(EnvironmentPathList("APS5_PATH_OVERLAYS"));
++    return *overlays;
++}
++
++void AddEnvironmentAliases(PathAliases& aliases) {
++    for (auto& entry : EnvironmentPathList("APS5_PATH_ALIASES")) aliases.entries.push_back(std::move(entry));
+ }
+ 
+ PathAliases& Aliases() {
+@@ -325,6 +336,19 @@ std::filesystem::path ResolveHostPath(std::filesystem::path root, const std::vec
+     return module ? PathOrRelinkedModule(root) : root;
+ }
+ 
++std::optional<std::filesystem::path> ResolveOverlay(const std::string& guestPath) {
++    const auto& overlays = PathOverlays();
++    if (overlays.empty() || guestPath.empty() || guestPath.back() == '/') return std::nullopt;
++    const auto relative = TrimSlashes(guestPath.c_str());
++    for (const auto& [prefix, host] : overlays) {
++        if (relative.size() == prefix.size() || !HasPrefix(relative, prefix)) continue;
++        auto candidate = ResolveHostPath(host, SplitNames(std::string_view(relative).substr(prefix.size() + 1))).make_preferred();
++        std::error_code error;
++        if (std::filesystem::is_regular_file(candidate, error)) return candidate;
++    }
++    return std::nullopt;
++}
++
+ std::optional<std::filesystem::path> ResolveAlias(const std::string& guestPath, bool module) {
+     const auto relative = TrimSlashes(guestPath.c_str());
+     auto& aliases = Aliases();
+@@ -377,6 +401,9 @@ std::optional<std::filesystem::path> ProvidedPath(const WorkingDirectory& state,
+     return provided.make_preferred();
+ }
+ std::filesystem::path HostPath(WorkingDirectory& state, const std::vector<std::string>& names, bool module = false) {
++    if (!module) {
++        if (auto overlaid = ResolveOverlay(JoinNames(names))) return *overlaid;
++    }
+     if (auto aliased = ResolveAlias(JoinNames(names), module)) return *aliased;
+     if (auto provided = ProvidedPath(state, names)) return *provided;
+     return ResolveHostPath(state.root, names, module).make_preferred();
+-- 
+2.55.0.windows.5
+

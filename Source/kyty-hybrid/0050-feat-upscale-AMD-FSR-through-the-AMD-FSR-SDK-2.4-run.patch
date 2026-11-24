@@ -1,0 +1,518 @@
+From 4f37a9a647330b38f7e6fe3044c69da4f82829e0 Mon Sep 17 00:00:00 2001
+From: Codex <local@invalid>
+Date: Fri, 20 Nov 2026 18:46:55 +0000
+Subject: [PATCH] feat(upscale): AMD FSR through the AMD FSR SDK 2.4 runtime
+
+ASTROHYBRID_FSR=1 replaces Astro Bot's temporal upscale pass with AMD FSR, as ASTROHYBRID_DLSS does with
+DLSS: same pass, colour, motion vectors, depth pairing and jitter conventions (renderer/fsr.inc, included
+by dlss.cpp). The SDK's signed Vulkan runtime (amd_fidelityfx_loader_vk.dll and
+amd_fidelityfx_upscaler_vk.dll) is loaded at run time from ASTROHYBRID_FSR_PATH; only headers are used
+at build time (KYTY_FFX_SDK_DIR). ASTROHYBRID_FSR_VERSION=auto (default) takes the newest version the
+runtime offers for the device (FSR 4.1.2 on Radeon RX 9000, otherwise 3.1.6, then 2.3.4) and falls back
+to the next one when a context cannot be created. The context is created for the largest input size seen,
+with dynamic resolution on. DLSS wins when both are requested. One "FSR 10s:" line every 10 s.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                                |   7 +
+ src/graphics/host_gpu/renderer/dlss.cpp       |  16 +-
+ src/graphics/host_gpu/renderer/dlss.h         |  12 +
+ src/graphics/host_gpu/renderer/fsr.inc        | 354 ++++++++++++++++++
+ src/graphics/host_gpu/renderer/render.h       |   2 +
+ src/graphics/host_gpu/renderer/renderDraw.cpp |   8 +-
+ 6 files changed, 395 insertions(+), 4 deletions(-)
+ create mode 100644 src/graphics/host_gpu/renderer/fsr.inc
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index cca6f074..c4126f46 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -2594,6 +2594,13 @@ if(KYTY_NGX_SDK_DIR)
+ 	target_include_directories(kyty_emulator PRIVATE "${KYTY_NGX_SDK_DIR}/include")
+ 	target_link_libraries(kyty_emulator "${KYTY_NGX_SDK_DIR}/lib/Windows_x86_64/nvsdk_ngx_d.lib")
+ endif()
++# AstroHybrid: AMD FSR upscaling through the AMD FSR SDK 2.4 API (renderer/fsr.inc), headers only; the
++# signed runtime DLLs are loaded at run time. Set to the SDK's Kits/FidelityFX folder; empty: not built in.
++set(KYTY_FFX_SDK_DIR "" CACHE PATH "AMD FSR SDK Kits/FidelityFX folder (FSR); empty to build without it")
++if(KYTY_FFX_SDK_DIR)
++	target_compile_definitions(kyty_emulator PRIVATE KYTY_FFX=1)
++	target_include_directories(kyty_emulator PRIVATE "${KYTY_FFX_SDK_DIR}/api/include" "${KYTY_FFX_SDK_DIR}/upscalers/include")
++endif()
+ # AstroHybrid: DLSS Frame Generation through Streamline (renderer/frameGen.cpp), headers only;
+ # sl.interposer.dll is loaded at run time. Empty: not built in.
+ set(KYTY_STREAMLINE_DIR "" CACHE PATH "NVIDIA Streamline SDK folder (DLSS-G); empty to build without it")
+diff --git a/src/graphics/host_gpu/renderer/dlss.cpp b/src/graphics/host_gpu/renderer/dlss.cpp
+index d4158ded..703be396 100644
+--- a/src/graphics/host_gpu/renderer/dlss.cpp
++++ b/src/graphics/host_gpu/renderer/dlss.cpp
+@@ -9,6 +9,16 @@
+ #include "graphics/host_gpu/renderer/renderContext.h"
+ #include "graphics/host_gpu/vulkanCommon.h"
+ 
++#if KYTY_FFX
++#ifndef _WINDOWS
++#define _WINDOWS
++#endif
++#include <ffx_api.h>
++#include <ffx_api_loader.h>
++#include <ffx_upscale.h>
++#include <vk/ffx_api_vk.h>
++#endif
++
+ #if KYTY_NGX
+ #include <nvsdk_ngx_helpers_vk.h>
+ #include <nvsdk_ngx_vk.h>
+@@ -22,6 +32,7 @@
+ #endif
+ #include <windows.h>
+ 
++#include <algorithm>
+ #include <array>
+ #include <atomic>
+ #include <chrono>
+@@ -30,6 +41,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <string>
++#include <vector>
+ 
+ namespace Libs::Graphics {
+ 
+@@ -398,7 +410,7 @@ void RenderExecutor::TagFrameGen(CommandBuffer& buffer, PreparedBindings& pixel)
+ }
+ 
+ void RenderExecutor::NoteDlssTargets(std::span<const RenderColorInfo> colors, ImageId depth) {
+-	if ((!Dlss::Requested() && !FrameGen::Requested()) || !depth) {
++	if ((!Dlss::Requested() && !FrameGen::Requested() && !Fsr::Requested()) || !depth) {
+ 		return;
+ 	}
+ 	auto& s = Get();
+@@ -641,4 +653,6 @@ bool RenderExecutor::TryDlssUpscale(CommandBuffer& buffer, PreparedBindings& pix
+ #endif
+ }
+ 
++#include "graphics/host_gpu/renderer/fsr.inc"
++
+ } // namespace Libs::Graphics
+diff --git a/src/graphics/host_gpu/renderer/dlss.h b/src/graphics/host_gpu/renderer/dlss.h
+index ae1728a9..b8606f6b 100644
+--- a/src/graphics/host_gpu/renderer/dlss.h
++++ b/src/graphics/host_gpu/renderer/dlss.h
+@@ -41,4 +41,16 @@ void ProbeBinaryImport(const char* when);
+ 
+ } // namespace Libs::Graphics::Dlss
+ 
++// ASTROHYBRID_FSR=1 (needs a build with KYTY_FFX_SDK_DIR): AMD FSR upscaling in place of the same
++// temporal upscale pass (RenderExecutor::TryFsrUpscale, fsr.inc), through the AMD FSR SDK 2.4 runtime
++// (amd_fidelityfx_loader_vk.dll + amd_fidelityfx_upscaler_vk.dll in ASTROHYBRID_FSR_PATH).
++// ASTROHYBRID_FSR_VERSION=auto|4|3|2 (default auto: FSR 4.1.2 where the device supports it, else 3.1.6,
++// else 2.3.4); ASTROHYBRID_FSR_SHARPNESS=0..1 (default 0). It shares ASTROHYBRID_DLSS_PASS,
++// _JITTER_SIGN and _DEPTH_INVERTED. DLSS wins when both are requested. One "FSR 10s:" line every 10 s.
++namespace Libs::Graphics::Fsr {
++
++[[nodiscard]] bool Requested();
++
++} // namespace Libs::Graphics::Fsr
++
+ #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DLSS_H_
+diff --git a/src/graphics/host_gpu/renderer/fsr.inc b/src/graphics/host_gpu/renderer/fsr.inc
+new file mode 100644
+index 00000000..85ca6be3
+--- /dev/null
++++ b/src/graphics/host_gpu/renderer/fsr.inc
+@@ -0,0 +1,354 @@
++// AMD FSR upscaling through the AMD FSR SDK 2.4 API (included by dlss.cpp, which owns the
++// temporal-upscale pass detection, the depth pairs and the jitter conventions; see dlss.h / fsr in
++// dlss.h for the options). The SDK's signed Vulkan runtime (amd_fidelityfx_loader_vk.dll and
++// amd_fidelityfx_upscaler_vk.dll) is loaded at run time from ASTROHYBRID_FSR_PATH; nothing of it is
++// linked in. The runtime offers FSR 4.1.2 (machine-learning upscaler, Radeon RX 9000 only), FSR 3.1.6
++// and FSR 2.3.4; "auto" takes the newest one the device can create, falling back version by version.
++
++namespace Fsr {
++
++bool Requested() {
++	static const bool requested = [] {
++		const char* value = std::getenv("ASTROHYBRID_FSR");
++		return value != nullptr && std::strcmp(value, "1") == 0;
++	}();
++	return requested;
++}
++
++} // namespace Fsr
++
++namespace {
++
++struct FsrState {
++	bool                     init_tried = false;
++	bool                     ready      = false;
++	std::string              wanted     = "auto"; // auto, 4, 3, 2
++	int                      quality    = 0;      // 0 quality .. 3 native (only for the report)
++	float                    sharpness  = 0.0f;
++#if KYTY_FFX
++	HMODULE                  module     = nullptr;
++	ffxFunctions             api {};
++	ffxContext               context    = nullptr;
++	std::vector<uint64_t>    version_ids;
++	std::vector<std::string> version_names;
++	size_t                   version_index = 0;
++	VkDeviceContext          device_context {};
++#endif
++	std::string              version_used;
++	uint32_t                 in_w = 0, in_h = 0, out_w = 0, out_h = 0;
++	uint32_t                 last_frame   = 0;
++	int64_t                  last_eval_ns = 0;
++	uint64_t                 evaluations  = 0;
++	std::array<uint64_t, static_cast<size_t>(Fallback::Count)> fallbacks {};
++	int64_t                  print_ns = 0;
++};
++
++FsrState& GetFsr() {
++	static FsrState state = [] {
++		FsrState s;
++		if (const char* value = std::getenv("ASTROHYBRID_FSR_VERSION"); value != nullptr && value[0] != '\0') {
++			s.wanted = value;
++		}
++		if (const char* value = std::getenv("ASTROHYBRID_FSR_SHARPNESS"); value != nullptr) {
++			s.sharpness = std::clamp(std::strtof(value, nullptr), 0.0f, 1.0f);
++		}
++		return s;
++	}();
++	return state;
++}
++
++void FsrSummary(FsrState& s) {
++	const auto now = NowNs();
++	if (s.print_ns == 0) {
++		s.print_ns = now;
++		return;
++	}
++	if (now - s.print_ns < 10'000'000'000LL) {
++		return;
++	}
++	s.print_ns = now;
++	std::string text;
++	for (size_t i = 0; i < s.fallbacks.size(); i++) {
++		if (s.fallbacks[i] != 0) {
++			text += " " + std::string(FALLBACK_NAMES[i]) + "=" + std::to_string(s.fallbacks[i]);
++		}
++	}
++	std::printf("FSR 10s: %s, evaluations %llu (%ux%u -> %ux%u) | game pass kept:%s\n",
++	            s.version_used.empty() ? "not created" : s.version_used.c_str(),
++	            static_cast<unsigned long long>(s.evaluations), s.in_w, s.in_h, s.out_w, s.out_h,
++	            text.empty() ? " none" : text.c_str());
++	std::fflush(stdout);
++	s.evaluations = 0;
++	s.fallbacks   = {};
++}
++
++bool FsrFail(FsrState& s, Fallback reason) {
++	s.fallbacks[static_cast<size_t>(reason)]++;
++	FsrSummary(s);
++	return false;
++}
++
++#if KYTY_FFX
++void FfxMessage(uint32_t type, const wchar_t* message) {
++	static std::atomic<uint32_t> logged {0};
++	if (logged.fetch_add(1) < 32) {
++		std::printf("FSR runtime %s: %ls\n", type == FFX_API_MESSAGE_TYPE_ERROR ? "error" : "warning",
++		            message);
++		std::fflush(stdout);
++	}
++}
++
++// The versions the runtime offers for this device, newest first, filtered by ASTROHYBRID_FSR_VERSION.
++bool FsrLoad(FsrState& s, GraphicContext& graphics) {
++	const char*  path_value = std::getenv("ASTROHYBRID_FSR_PATH");
++	std::string  dir        = path_value != nullptr ? path_value : "";
++	std::string  file       = dir.empty() ? "amd_fidelityfx_loader_vk.dll" : dir + "\\amd_fidelityfx_loader_vk.dll";
++	if (!dir.empty()) {
++		// The loader finds amd_fidelityfx_upscaler_vk.dll next to itself or on the DLL search path.
++		SetDllDirectoryA(dir.c_str());
++	}
++	s.module = LoadLibraryExA(file.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
++	if (!dir.empty()) {
++		SetDllDirectoryA(nullptr);
++	}
++	if (s.module == nullptr) {
++		std::printf("FSR: %s could not be loaded (error %lu)\n", file.c_str(), GetLastError());
++		std::fflush(stdout);
++		return false;
++	}
++	ffxLoadFunctions(&s.api, s.module);
++	if (s.api.CreateContext == nullptr || s.api.Query == nullptr || s.api.Dispatch == nullptr ||
++	    s.api.DestroyContext == nullptr) {
++		std::printf("FSR: the loader does not export the FSR API\n");
++		std::fflush(stdout);
++		return false;
++	}
++	s.device_context.vkDevice         = static_cast<VkDevice>(graphics.device);
++	s.device_context.vkPhysicalDevice = static_cast<VkPhysicalDevice>(graphics.physical_device);
++	s.device_context.vkDeviceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr;
++
++	uint64_t                count = 0;
++	ffxQueryDescGetVersions query {};
++	query.header.type    = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
++	query.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
++	query.device         = &s.device_context;
++	query.outputCount    = &count;
++	if (s.api.Query(nullptr, &query.header) != FFX_API_RETURN_OK || count == 0) {
++		std::printf("FSR: the runtime reports no upscaler versions for this device\n");
++		std::fflush(stdout);
++		return false;
++	}
++	std::vector<uint64_t>    ids(count);
++	std::vector<const char*> names(count);
++	query.versionIds   = ids.data();
++	query.versionNames = names.data();
++	s.api.Query(nullptr, &query.header);
++	std::string offered;
++	for (uint64_t i = 0; i < count; i++) {
++		const std::string name = names[i] != nullptr ? names[i] : "?";
++		offered += (i == 0 ? "" : ", ") + name;
++		// "auto": every version; "4" / "3" / "2": that major version and older ones as fallbacks.
++		const int major = name.empty() ? 0 : name[0] - '0';
++		if (s.wanted != "auto" && major > std::atoi(s.wanted.c_str())) {
++			continue;
++		}
++		s.version_ids.push_back(ids[i]);
++		s.version_names.push_back(name);
++	}
++	std::printf("FSR: runtime loaded, upscaler versions %s; trying %s first (ASTROHYBRID_FSR_VERSION=%s)\n",
++	            offered.c_str(), s.version_names.empty() ? "none" : s.version_names[0].c_str(),
++	            s.wanted.c_str());
++	std::fflush(stdout);
++	return !s.version_ids.empty();
++}
++
++FfxApiResource FsrResource(const Image& image, bool depth, uint32_t state) {
++	VkImageCreateInfo info {};
++	info.sType       = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++	info.imageType   = VK_IMAGE_TYPE_2D;
++	info.format      = static_cast<VkFormat>(image.backing.format);
++	info.extent      = {image.info.extent.width, image.info.extent.height, 1};
++	info.mipLevels   = 1;
++	info.arrayLayers = 1;
++	info.usage       = static_cast<VkImageUsageFlags>(image.backing.usage);
++	(void)depth;
++	return ffxApiGetResourceVK(static_cast<VkImage>(image.backing.image),
++	                           ffxApiGetImageResourceDescriptionVK(
++	                               static_cast<VkImage>(image.backing.image), info, 0),
++	                           state);
++}
++#endif
++
++} // namespace
++
++bool RenderExecutor::TryFsrUpscale(CommandBuffer& buffer, PreparedBindings& pixel, ImageId output) {
++	if (!Fsr::Requested() || pixel.runtime == nullptr || !*pixel.runtime) {
++		return false;
++	}
++	auto& d = Get();
++	if (pixel.runtime->program->shader_hash != d.pass_hash) {
++		return false;
++	}
++	auto& s = GetFsr();
++#if !KYTY_FFX
++	(void)buffer;
++	(void)output;
++	return FsrFail(s, Fallback::NotBuiltIn);
++#else
++	if (pixel.images.size() < 2 || !output || pixel.buffer_sources.empty() ||
++	    pixel.buffer_sources[0].address == 0 || pixel.buffer_sources[0].size < 56) {
++		return FsrFail(s, Fallback::Bindings);
++	}
++	const auto* cb = reinterpret_cast<const uint32_t*>(pixel.buffer_sources[0].address);
++	float       jitter_uv[2];
++	std::memcpy(jitter_uv, cb, sizeof(jitter_uv));
++	const uint32_t out_w = cb[4], out_h = cb[5], in_w = cb[6], in_h = cb[7], frame = cb[11];
++	if (cb[13] == 0) {
++		return FsrFail(s, Fallback::NoMotionVectors);
++	}
++	auto&      cache    = m_context.GetTextureCache();
++	const auto mv_id    = pixel.images[0].image_id;
++	const auto color_id = pixel.images[1].image_id;
++	ImageId    depth_id {};
++	for (const auto& pair: d.depth_pairs) {
++		if (pair.color == mv_id) {
++			depth_id = pair.depth;
++		}
++	}
++	if (!depth_id || cache.m_slot_images.try_get(depth_id) == nullptr) {
++		return FsrFail(s, Fallback::NoDepth);
++	}
++	auto& mv    = cache.GetImage(mv_id);
++	auto& color = cache.GetImage(color_id);
++	auto& depth = cache.GetImage(depth_id);
++	auto& out   = cache.GetImage(output);
++	const auto same = [](const Image& image, uint32_t w, uint32_t h) {
++		return image.info.extent.width == w && image.info.extent.height == h &&
++		       image.backing.image != nullptr && image.info.samples == 1;
++	};
++	if (!same(mv, in_w, in_h) || !same(color, in_w, in_h) || !same(depth, in_w, in_h) ||
++	    !same(out, out_w, out_h) || !depth.info.IsDepth() ||
++	    !(out.backing.usage & vk::ImageUsageFlagBits::eStorage)) {
++		return FsrFail(s, Fallback::Sizes);
++	}
++	auto& graphics = m_context.GetGraphics();
++	if (!s.init_tried) {
++		s.init_tried = true;
++		s.ready      = FsrLoad(s, graphics);
++	}
++	if (!s.ready) {
++		return FsrFail(s, Fallback::Unavailable);
++	}
++
++	buffer.EndRendering();
++	const auto cmd = buffer.Handle();
++	// The context is created for the largest sizes seen; the game's dynamic resolution changes the
++	// input size from frame to frame within it (FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION).
++	if (s.context == nullptr || in_w > s.in_w || in_h > s.in_h || out_w != s.out_w || out_h != s.out_h) {
++		const uint32_t max_w = std::max(in_w, s.out_w == out_w ? s.in_w : 0u);
++		const uint32_t max_h = std::max(in_h, s.out_h == out_h ? s.in_h : 0u);
++		if (s.context != nullptr) {
++			// The GPU may still use the old context's resources: wait for it before destroying it.
++			graphics.device.waitIdle();
++			s.api.DestroyContext(&s.context, nullptr);
++			s.context = nullptr;
++		}
++		while (s.context == nullptr && s.version_index < s.version_ids.size()) {
++			ffxCreateBackendVKDesc backend {};
++			backend.header.type   = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
++			backend.deviceContext = s.device_context;
++			ffxOverrideVersion version {};
++			version.header.type  = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
++			version.versionId    = s.version_ids[s.version_index];
++			backend.header.pNext = &version.header;
++			ffxCreateContextDescUpscale create {};
++			create.header.type  = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
++			create.header.pNext = &backend.header;
++			create.flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE |
++			               FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION |
++			               FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION |
++			               (d.depth_inverted ? FFX_UPSCALE_ENABLE_DEPTH_INVERTED : 0u);
++			create.maxRenderSize  = {max_w, max_h};
++			create.maxUpscaleSize = {out_w, out_h};
++			create.fpMessage      = FfxMessage;
++			const auto result     = s.api.CreateContext(&s.context, &create.header, nullptr);
++			if (result != FFX_API_RETURN_OK || s.context == nullptr) {
++				std::printf("FSR: %s could not be created (%u) for %ux%u -> %ux%u; trying the next version\n",
++				            s.version_names[s.version_index].c_str(), static_cast<unsigned>(result), max_w,
++				            max_h, out_w, out_h);
++				std::fflush(stdout);
++				s.context = nullptr;
++				s.version_index++;
++				continue;
++			}
++			s.version_used = "FSR " + s.version_names[s.version_index];
++			std::printf("FSR: %s created, up to %ux%u -> %ux%u, depth inverted %d, jitter sign %+.0f\n",
++			            s.version_used.c_str(), max_w, max_h, out_w, out_h, d.depth_inverted ? 1 : 0,
++			            static_cast<double>(d.jitter_sign));
++			std::fflush(stdout);
++		}
++		buffer.ForgetBoundState();
++		if (s.context == nullptr) {
++			s.ready = false;
++			return FsrFail(s, Fallback::CreateFailed);
++		}
++		s.in_w  = max_w;
++		s.in_h  = max_h;
++		s.out_w = out_w;
++		s.out_h = out_h;
++	}
++
++	mv.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderSampledRead, {}, cmd);
++	color.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderSampledRead, {},
++	              cmd);
++	depth.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderSampledRead, {},
++	              cmd);
++	out.Transit(vk::ImageLayout::eGeneral,
++	            vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eShaderStorageWrite, {},
++	            cmd);
++
++	const auto now = NowNs();
++	ffxDispatchDescUpscale dispatch {};
++	dispatch.header.type   = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
++	dispatch.commandList   = static_cast<VkCommandBuffer>(cmd);
++	dispatch.color         = FsrResource(color, false, FFX_API_RESOURCE_STATE_COMPUTE_READ);
++	dispatch.depth         = FsrResource(depth, true, FFX_API_RESOURCE_STATE_COMPUTE_READ);
++	dispatch.motionVectors = FsrResource(mv, false, FFX_API_RESOURCE_STATE_COMPUTE_READ);
++	dispatch.output        = FsrResource(out, false, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
++	// Same conventions as DLSS (dlss.h): jitter in input pixels, motion vectors in UV from the
++	// previous to the current position, so scaled by minus the input size.
++	dispatch.jitterOffset      = {d.jitter_sign * jitter_uv[0] * static_cast<float>(in_w),
++	                              d.jitter_sign * jitter_uv[1] * static_cast<float>(in_h)};
++	dispatch.motionVectorScale = {-static_cast<float>(in_w), -static_cast<float>(in_h)};
++	dispatch.renderSize        = {in_w, in_h};
++	dispatch.upscaleSize       = {out_w, out_h};
++	dispatch.enableSharpening  = s.sharpness > 0.0f;
++	dispatch.sharpness         = s.sharpness;
++	dispatch.frameTimeDelta =
++	    s.last_eval_ns != 0 ? std::clamp(static_cast<float>(now - s.last_eval_ns) / 1.0e6f, 1.0f, 100.0f)
++	                        : 16.7f;
++	dispatch.preExposure             = 1.0f;
++	dispatch.reset                   = s.last_frame != 0 && frame != s.last_frame + 1;
++	dispatch.cameraNear              = 0.1f;
++	dispatch.cameraFar               = 10000.0f;
++	dispatch.cameraFovAngleVertical  = 1.0472f;
++	dispatch.viewSpaceToMetersFactor = 1.0f;
++	s.last_frame   = frame;
++	s.last_eval_ns = now;
++	const auto result = s.api.Dispatch(&s.context, &dispatch.header);
++	buffer.ForgetBoundState();
++	if (result != FFX_API_RETURN_OK) {
++		static std::atomic<uint32_t> logged {0};
++		if (logged.fetch_add(1) < 8) {
++			std::printf("FSR: dispatch failed (%u)\n", static_cast<unsigned>(result));
++			std::fflush(stdout);
++		}
++		return FsrFail(s, Fallback::EvaluateFailed);
++	}
++	out.NoteContentWrite();
++	cache.CommitGpuWrite(out);
++	s.evaluations++;
++	FsrSummary(s);
++	return true;
++#endif
++}
+diff --git a/src/graphics/host_gpu/renderer/render.h b/src/graphics/host_gpu/renderer/render.h
+index ded9d461..2f71bbb7 100644
+--- a/src/graphics/host_gpu/renderer/render.h
++++ b/src/graphics/host_gpu/renderer/render.h
+@@ -1187,6 +1187,8 @@ private:
+ 	void NoteDlssTargets(std::span<const RenderColorInfo> colors, ImageId depth);
+ 	[[nodiscard]] bool TryDlssUpscale(CommandBuffer& buffer, PreparedBindings& pixel,
+ 	                                  ImageId output);
++	// ASTROHYBRID_FSR (dlss.h): the same pass replaced by AMD FSR (true: recorded, the draw is done).
++	[[nodiscard]] bool TryFsrUpscale(CommandBuffer& buffer, PreparedBindings& pixel, ImageId output);
+ 	// ASTROHYBRID_DLSSG (frameGen.h): the camera from a draw's bound constants, and the frame's
+ 	// depth, motion vectors and constants at the temporal upscale pass.
+ 	void NoteFrameGenCamera(const PreparedBindings& stage);
+diff --git a/src/graphics/host_gpu/renderer/renderDraw.cpp b/src/graphics/host_gpu/renderer/renderDraw.cpp
+index 25b4d339..046c0859 100644
+--- a/src/graphics/host_gpu/renderer/renderDraw.cpp
++++ b/src/graphics/host_gpu/renderer/renderDraw.cpp
+@@ -4166,15 +4166,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
+ 	// ASTROHYBRID_DLSS (dlss.h): depth attachments by colour target, and the game's temporal
+ 	// upscale replaced by DLSS Super Resolution. A replaced draw records nothing else; like a
+ 	// skipped one (KYTY_PIPELINE_SKIP below) no run record may be continued across it.
+-	if (Dlss::Requested() || FrameGen::Requested()) [[unlikely]] {
++	if (Dlss::Requested() || FrameGen::Requested() || Fsr::Requested()) [[unlikely]] {
+ 		NoteDlssTargets(std::span<const RenderColorInfo> {state.color_info, state.color_count},
+ 		                state.depth_info.image_id);
+ 		if (FrameGen::Active() && state.ps_active && bindings.pixel.has_value()) {
+ 			NoteFrameGenCamera(*bindings.pixel);
+ 			TagFrameGen(buffer, *bindings.pixel);
+ 		}
+-		if (Dlss::Requested() && state.ps_active && bindings.pixel.has_value() && state.color_count != 0 &&
+-		    TryDlssUpscale(buffer, *bindings.pixel, state.color_info[0].image_id)) {
++		if (state.ps_active && bindings.pixel.has_value() && state.color_count != 0 &&
++		    ((Dlss::Requested() && TryDlssUpscale(buffer, *bindings.pixel, state.color_info[0].image_id)) ||
++		     (!Dlss::Requested() && Fsr::Requested() &&
++		      TryFsrUpscale(buffer, *bindings.pixel, state.color_info[0].image_id)))) {
+ 			m_run.valid        = false;
+ 			m_run_active       = false;
+ 			m_run_targets_kept = false;
+-- 
+2.55.0.windows.5
+

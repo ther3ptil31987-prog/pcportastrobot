@@ -1,0 +1,38 @@
+From a0c11360d9d1b561d51d80a7df82b21856b4ff22 Mon Sep 17 00:00:00 2001
+From: Codex <local@invalid>
+Date: Fri, 20 Nov 2026 01:01:58 +0000
+Subject: [PATCH 49/49] feat(controller): adaptive trigger strength from
+ ASTROHYBRID_TRIGGER_STRENGTH
+
+ASTROHYBRID_TRIGGER_STRENGTH (percent, 0-100, default 100) scales the DualSense adaptive triggers'
+resistance and vibration; 0 turns them off (pcportastrobot #160). The in-game hotkey still cycles
+on top of it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/libs/controller.cpp | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/src/libs/controller.cpp b/src/libs/controller.cpp
+index ee068423..57d6f099 100644
+--- a/src/libs/controller.cpp
++++ b/src/libs/controller.cpp
+@@ -334,7 +334,14 @@ float GameController::GetSettingScale(Setting setting) const {
+ 	if (setting == Setting::VibrationIntensity) {
+ 		return INTENSITY[step] * (Config::GetControllerVibrationIntensity() / 100.0f);
+ 	}
+-	return INTENSITY[step];
++	// ASTROHYBRID_TRIGGER_STRENGTH (percent, 0-100, default 100): the adaptive triggers' resistance and
++	// vibration, from the launcher (pcportastrobot #160; 0 = off). The in-game hotkey still cycles on top.
++	static const float trigger_strength = [] {
++		const char* value   = std::getenv("ASTROHYBRID_TRIGGER_STRENGTH");
++		const long  percent = value != nullptr && value[0] != '\0' ? std::strtol(value, nullptr, 10) : 100;
++		return static_cast<float>(std::clamp(percent, 0L, 100L)) / 100.0f;
++	}();
++	return INTENSITY[step] * trigger_strength;
+ }
+ 
+ static uint8_t Scale(uint8_t value, float scale) {
+-- 
+2.55.0.windows.5
+

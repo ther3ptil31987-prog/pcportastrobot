@@ -11,6 +11,17 @@ namespace AstroHybrid.App.Services
         private const string ExpectedTitleId = "PPSA21567";
         private const string ExpectedVersion = "01.019.000";
 
+        // Versions with a known failure, and what to tell the player. 01.007.000 (US PPSA21564 launch version)
+        // stops with game asserts in the asset loader on New Game and galaxy travel ("Duplicated definition name
+        // []", "Xml file \"(null)\" is broken", OdxAsyncLoader crashes: #54, #47, #80, #130); players who moved to
+        // 01.019.000 report that it plays.
+        public const string KnownBadVersion = "01.007.000";
+        public const string KnownBadVersionWarning =
+            "This dump is game version 01.007.000. With this version Astro Bot is known to crash when you start a New Game, " +
+            "load the world map or travel to a galaxy (errors such as \"Duplicated definition name\" or \"Xml file is broken\").\n\n" +
+            "Version 01.019.000 is the tested one and plays normally. You can still set this version up, but if it crashes, " +
+            "please update your dump to 01.019.000.";
+
         public async Task<GameInfo> ValidateGameDumpAsync(string gamePath)
         {
             var gameInfo = new GameInfo
@@ -93,7 +104,12 @@ namespace AstroHybrid.App.Services
 
                 gameInfo.IsValid = true;
                 gameInfo.ValidationError = null;
-                if (!testedVersion)
+                if (gameInfo.Version == KnownBadVersion)
+                {
+                    gameInfo.Warning = KnownBadVersionWarning;
+                    gameInfo.Version += " (known to crash: 01.019.000 recommended)";
+                }
+                else if (!testedVersion)
                 {
                     gameInfo.Version += " (not tested; features this version does not support turn themselves off)";
                 }

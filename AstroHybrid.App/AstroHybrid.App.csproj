@@ -50,6 +50,7 @@
     <Reference Include="System" />
     <Reference Include="System.Core" />
     <Reference Include="System.Drawing" />
+    <Reference Include="System.IO.Compression" />
     <Reference Include="System.IO.Compression.FileSystem" />
     <Reference Include="System.Management" />
     <Reference Include="System.Net.Http" />
@@ -112,6 +113,9 @@
     <Compile Include="Services\HardwareDetector.cs" />
     <Compile Include="Services\ControllerDetector.cs" />
     <Compile Include="Services\InstallationManager.cs" />
+    <Compile Include="Services\ShaderPrep.cs" />
+    <Compile Include="Services\Patch0107.cs" />
+    <Compile Include="Views\ShaderPrepWindow.cs" />
     <Compile Include="Services\LauncherService.cs" />
     <Compile Include="Services\UpdateService.cs" />
     <Compile Include="Services\SelfUnwrapper.cs" />

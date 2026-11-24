@@ -8,8 +8,8 @@ rerunning game setup with an older download. See [the ZAR guide](../Docs/ZAR.md)
 
 | File in the download | Built from |
 |---|---|
-| `Build\RunHybrid\kyty_gpu.dll` | KytyPS5 (Jetsku), tag `u59-windows-20261024-int21` (commit `744705ee1df4b0acb1af382ff5c32ca4a20aa5f7`) + `Source/kyty-hybrid/*.patch` (36 patches) |
-| `Build\RunHybrid\libs\*.prx`, `astrohybrid_host.dll`, `tools\relinker.exe` | AnyPS5, upstream `main` commit `319621ba2e578bd053b0baba2877fe70520e0737` + `Source/anyps5/*.patch` (27 patches) |
+| `Build\RunHybrid\kyty_gpu.dll` | KytyPS5 (Jetsku), tag `u59-windows-20261024-int21` (commit `744705ee1df4b0acb1af382ff5c32ca4a20aa5f7`) + `Source/kyty-hybrid/*.patch` (55 patches) |
+| `Build\RunHybrid\libs\*.prx`, `astrohybrid_host.dll`, `tools\relinker.exe` | AnyPS5, upstream `main` commit `319621ba2e578bd053b0baba2877fe70520e0737` + `Source/anyps5/*.patch` (32 patches) |
 | `AstroHybrid.exe` | `AstroHybrid.App/` in this repository |
 | `nvngx_dlss.dll`, `nvngx_dlssg.dll`, `sl.*.dll`, `NvLowLatencyVk.dll` | NVIDIA runtime files, unmodified (DLSS SDK / Streamline 2.14.16), under the licences in `licenses/` |
 | `Build\RunHybrid\anyps5-fonts\*` | Noto fonts, unmodified (SIL Open Font License) |
@@ -30,7 +30,7 @@ cd kyty
 git checkout u59-windows-20261024-int21
 git submodule update --init --recursive
 git am --keep-cr <this repo>/Source/kyty-hybrid/*.patch
-git rev-parse HEAD^{tree}     # daaca7b52eac480bd9dbdcd0975e8cbe64890a7a
+git rev-parse HEAD^{tree}     # 476fec7f6f61b98c4daf98695455714b5e03a855
 ```
 
 Build (Windows, Visual Studio 2022 Build Tools x64 environment, LLVM 22.1.3 clang-cl, Ninja, Vulkan SDK):
@@ -40,7 +40,10 @@ Build (Windows, Visual Studio 2022 Build Tools x64 environment, LLVM 22.1.3 clan
 2. For DLSS and frame generation, also pass `-DKYTY_NGX_SDK_DIR=<streamline>/external/ngx-sdk` and
    `-DKYTY_STREAMLINE_DIR=<streamline>`, where `<streamline>` is NVIDIA's Streamline SDK 2.14.16
    (https://github.com/NVIDIA-RTX/Streamline). Without them the DLL builds with DLSS and frame
-   generation left out.
+   generation left out. For AMD FSR, pass `-DKYTY_FFX_SDK_DIR=<fsr>/Kits/FidelityFX`, where `<fsr>` is
+   AMD's FSR SDK 2.4.0 (https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK, tag `v2.4.0`); the
+   release ships the SDK's signed `amd_fidelityfx_loader_vk.dll`, `amd_fidelityfx_upscaler_vk.dll` (FSR upscaling)
+   and `amd_fidelityfx_framegeneration_vk.dll` (FSR frame generation).
 3. `cmake --build <build> --target kyty_emulator`
 4. `python -I tools/hybrid/build_kyty_gpu.py <build> <out>` links `<out>\kyty_gpu.dll` from the
    emulator's objects and the bridge.
@@ -70,6 +73,9 @@ Build with WinLibs GCC 15.2.0 (posix-seh UCRT) as `Tools/build.ps1` does: config
 Release, build everything and the `libs` target. `core/relinker/relinker.exe` is the relinker; the
 `libs` target produces the `.prx` system libraries, `libAstroHybridHost.prx` is shipped as
 `astrohybrid_host.dll`. `Tools/hybrid/make_run_hybrid.py` shows how the game folder is laid out.
+`libSceAgc.prx`, `libSceAgcDriver.prx` and `libSceVideoOut.prx` in the download are not AnyPS5's own
+builds: they are small forwarder shims made by `make_run_hybrid.py` that hand graphics to `kyty_gpu.dll`.
+Installing AnyPS5's real ones makes the game stop with `DisplayWindow: Couldn't create window`.
 The older `Source/patches` folder holds a historical 26-patch subset; it does not include the new ZAR fixes.
 
 Focused regression tests after a configured build:

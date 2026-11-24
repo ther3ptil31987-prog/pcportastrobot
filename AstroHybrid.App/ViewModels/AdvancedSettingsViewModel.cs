@@ -178,35 +178,6 @@ namespace AstroHybrid.App.ViewModels
             }
         }
 
-        // Wireless DualSense (Bluetooth HID audio/haptics) - issue #34
-        public bool DualSenseWirelessSpeaker
-        {
-            get => _mainViewModel.Settings.DualSenseWirelessSpeaker;
-            set
-            {
-                if (!Equals(_mainViewModel.Settings.DualSenseWirelessSpeaker, value))
-                {
-                    _mainViewModel.Settings.DualSenseWirelessSpeaker = value;
-                    OnPropertyChanged();
-                    _mainViewModel.OnPropertyChanged(nameof(MainWindowViewModel.Settings));
-                }
-            }
-        }
-
-        public bool DualSenseWirelessHaptics
-        {
-            get => _mainViewModel.Settings.DualSenseWirelessHaptics;
-            set
-            {
-                if (!Equals(_mainViewModel.Settings.DualSenseWirelessHaptics, value))
-                {
-                    _mainViewModel.Settings.DualSenseWirelessHaptics = value;
-                    OnPropertyChanged();
-                    _mainViewModel.OnPropertyChanged(nameof(MainWindowViewModel.Settings));
-                }
-            }
-        }
-
         public bool SkipIntro
         {
             get => _mainViewModel.Settings.SkipIntro;
@@ -240,10 +211,6 @@ namespace AstroHybrid.App.ViewModels
         public string MotionNote => "Enables accelerometer/gyroscope input for shake and tilt moves. Disable if your controller doesn't have motion sensors.";
 
         public string TriggerNote2 => "Enables DualSense trigger effect state reporting. The game ignores L2/R2 without it.";
-
-        public string DualSenseWirelessSpeakerNote => "Routes the DualSense speaker audio over Bluetooth HID. Requires a Bluetooth-connected DualSense; wired controllers use USB audio instead.";
-
-        public string DualSenseWirelessHapticsNote => "Routes DualSense haptic feedback over Bluetooth HID. Requires a Bluetooth-connected DualSense; wired controllers use USB audio instead.";
 
         public string SkipIntroNote => "Skips the opening PlayStation Studios and Team Asobi intro videos (-skipIntro).";
 

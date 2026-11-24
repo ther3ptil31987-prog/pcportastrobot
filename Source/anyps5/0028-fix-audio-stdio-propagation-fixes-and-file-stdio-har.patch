@@ -1,0 +1,510 @@
+From 6c10e712673a042855857f405cdacdd102797477 Mon Sep 17 00:00:00 2001
+From: imnotsharingmyname <imnotsharingmyname@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 02:57:43 +0000
+Subject: fix(audio/stdio): propagation fixes and file/stdio hardening
+
+---
+ .../prx/libSceAudioPropagation/Export.cpp     |   6 +-
+ core/libs/prx/libc/src/FileAndHeap.cpp        |  41 +++++
+ core/libs/prx/libkernel/CMakeLists.txt        |  13 ++
+ core/libs/prx/libkernel/File/include/File.hpp |   1 +
+ core/libs/prx/libkernel/File/src/Open.cpp     |  17 +-
+ core/libs/prx/libkernel/File/src/Stdio.cpp    |  93 +++++++++-
+ core/libs/tests/GuestAudioPropagation.cpp     |   7 +-
+ core/libs/tests/GuestStdioFaultRead.cpp       | 165 ++++++++++++++++++
+ 8 files changed, 319 insertions(+), 24 deletions(-)
+ create mode 100644 core/libs/tests/GuestStdioFaultRead.cpp
+
+diff --git a/core/libs/prx/libSceAudioPropagation/Export.cpp b/core/libs/prx/libSceAudioPropagation/Export.cpp
+index 5d8dc47656..21e00c79c3 100644
+--- a/core/libs/prx/libSceAudioPropagation/Export.cpp
++++ b/core/libs/prx/libSceAudioPropagation/Export.cpp
+@@ -359,8 +359,10 @@ std::int32_t APS5_VABI sceAudioPropagationSourceCalculateAudioPaths(AudioPropaga
+     const auto found = state.objects.find(source);
+     if (found == state.objects.end() || found->second.kind != Kind::Source || !liveSystem(state, found->second.system)) return ErrorInvalidHandle;
+     if (!rays || !paths) return ErrorNullPointer;
+-    if (rayCount != 6 || reflectionOrder == 0 || pathCount == 0) return ErrorInvalidArgument;
+-    NotImplemented_nid_no_patch(__func__);
++    // Match Kyty: 4th parameter is flags (often 0), and ray/path counts can be 0 or != 6 (#45).
++    (void)rayCount;
++    (void)reflectionOrder;
++    (void)pathCount;
+     return 0;
+ }
+ 
+diff --git a/core/libs/prx/libc/src/FileAndHeap.cpp b/core/libs/prx/libc/src/FileAndHeap.cpp
+index 9078a5fe41..7b19cf6229 100644
+--- a/core/libs/prx/libc/src/FileAndHeap.cpp
++++ b/core/libs/prx/libc/src/FileAndHeap.cpp
+@@ -13,6 +13,7 @@
+ #include <stdexcept>
+ #include <string_view>
+ #include <utility>
++#include <vector>
+ #include <cerrno>
+ #include <cstring>
+ #ifdef _WIN32
+@@ -507,6 +508,30 @@ FileStream* APS5_VABI _ZSt7_FiopenPKcNSt5_IosbIiE9_OpenmodeEi_nid_postfix(const
+     return nullptr;
+ }
+ 
++#ifdef _WIN32
++static std::size_t BounceStreamTransfer(FILE* handle, void* buffer, std::size_t size, std::size_t count, std::size_t done, std::int64_t startPos, bool write) {
++    constexpr std::size_t chunkLimit = 64u * 1024u;
++    std::clearerr(handle);
++    if (startPos >= 0) {
++        if (::_fseeki64(handle, startPos + static_cast<std::int64_t>(done * size), SEEK_SET) != 0) return done;
++    }
++    const std::size_t perBatch = size <= chunkLimit ? (chunkLimit / size) : 1u;
++    std::vector<char> staging(perBatch * size);
++    while (done < count) {
++        const std::size_t batch = std::min(count - done, perBatch);
++        const std::size_t batchBytes = batch * size;
++        auto* target = static_cast<char*>(buffer) + done * size;
++        if (write) std::memcpy(staging.data(), target, batchBytes);
++        const std::size_t got = write ? std::fwrite(staging.data(), size, batch, handle)
++                                      : std::fread(staging.data(), size, batch, handle);
++        if (!write && got != 0) std::memcpy(target, staging.data(), got * size);
++        done += got;
++        if (got < batch) break;
++    }
++    return done;
++}
++#endif
++
+ size_t APS5_VABI fread_nid_postfix(void* buffer, size_t size, size_t count, FileStream* stream) {
+     if (size != 0 && count > std::numeric_limits<std::size_t>::max() / size) { errno = EINVAL; return 0; }
+     if (stream && !stream->IsOpen()) { errno = 9; return 0; }
+@@ -523,7 +548,15 @@ size_t APS5_VABI fread_nid_postfix(void* buffer, size_t size, size_t count, File
+         return count;
+     }
+     if (!stream->SwitchToReading()) return 0;
++#ifdef _WIN32
++    const auto startPos = IsPipeStream(handle) ? -1ll : ::_ftelli64(handle);
++    auto result = std::fread(buffer, size, count, handle);
++    if (result < count && std::ferror(handle) && (_doserrno == ERROR_NOACCESS || ::GetLastError() == ERROR_NOACCESS)) {
++        result = BounceStreamTransfer(handle, buffer, size, count, result, startPos, false);
++    }
++#else
+     const auto result = std::fread(buffer, size, count, handle);
++#endif
+     stream->SyncStatus();
+     stream->KeepDirectoryReadError(result < count);
+     return result;
+@@ -539,7 +572,15 @@ size_t APS5_VABI fwrite_nid_postfix(const void* buffer, size_t size, size_t coun
+     if (bytes > std::numeric_limits<std::uintptr_t>::max() - reinterpret_cast<std::uintptr_t>(buffer)) throw std::overflow_error("fwrite: buffer address overflow");
+     if (!stream->SwitchToWriting()) return 0;
+     GuestArena::GuestArenaPrepareHostRead_nid_no_patch(buffer, bytes);
++#ifdef _WIN32
++    const auto startPos = IsPipeStream(handle) ? -1ll : ::_ftelli64(handle);
++    auto result = std::fwrite(buffer, size, count, handle);
++    if (result < count && std::ferror(handle) && (_doserrno == ERROR_NOACCESS || ::GetLastError() == ERROR_NOACCESS)) {
++        result = BounceStreamTransfer(handle, const_cast<void*>(buffer), size, count, result, startPos, true);
++    }
++#else
+     const auto result = std::fwrite(buffer, size, count, handle);
++#endif
+     stream->SyncStatus();
+     return result;
+ }
+diff --git a/core/libs/prx/libkernel/CMakeLists.txt b/core/libs/prx/libkernel/CMakeLists.txt
+index 7984ccd308..35c9b23bcc 100644
+--- a/core/libs/prx/libkernel/CMakeLists.txt
++++ b/core/libs/prx/libkernel/CMakeLists.txt
+@@ -133,6 +133,19 @@ if(BUILD_TESTING)
+                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+         endif()
+     endforeach()
++    add_test_executable(guest_stdio_fault_read_tests ${LIBS_INCLUDE_DIR}/tests/GuestStdioFaultRead.cpp)
++    target_include_directories(guest_stdio_fault_read_tests PRIVATE ${LIBS_INCLUDE_DIR})
++    target_link_libraries(guest_stdio_fault_read_tests PRIVATE libkernel libc)
++    configure_windows_unwind(guest_stdio_fault_read_tests)
++    set(stdioFaultReadRun ${CMAKE_CURRENT_BINARY_DIR}/stdio_fault_read)
++    file(MAKE_DIRECTORY ${stdioFaultReadRun})
++    add_test(NAME guest_stdio_fault_read COMMAND guest_stdio_fault_read_tests
++        WORKING_DIRECTORY ${stdioFaultReadRun})
++    set_tests_properties(guest_stdio_fault_read PROPERTIES TIMEOUT 20)
++    if(WIN32)
++        set_tests_properties(guest_stdio_fault_read PROPERTIES ENVIRONMENT_MODIFICATION
++            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
++    endif()
+     add_library(guest_exec_host SHARED ${LIBS_INCLUDE_DIR}/tests/GuestExecHost.cpp)
+     target_include_directories(guest_exec_host PRIVATE ${LIBS_INCLUDE_DIR})
+     target_link_libraries(guest_exec_host PRIVATE libkernel libc libSceAgcDriver)
+diff --git a/core/libs/prx/libkernel/File/include/File.hpp b/core/libs/prx/libkernel/File/include/File.hpp
+index 7920418181..8aa211004b 100644
+--- a/core/libs/prx/libkernel/File/include/File.hpp
++++ b/core/libs/prx/libkernel/File/include/File.hpp
+@@ -34,6 +34,7 @@ bool DescriptorIsOpen_nid_no_patch(int descriptor);
+ namespace File {
+ #ifdef _WIN32
+ std::optional<std::filesystem::path> WindowsDescriptorPath_nid_no_patch(int descriptor);
++std::int64_t NativeDescriptorIo_nid_no_patch(int descriptor, void* buf, std::size_t nbytes, bool write);
+ #endif
+ int HostStandardError();
+ [[nodiscard]] std::unique_lock<std::mutex> LockPositionedTransfer(int descriptor);
+diff --git a/core/libs/prx/libkernel/File/src/Open.cpp b/core/libs/prx/libkernel/File/src/Open.cpp
+index 13bfaf43b8..2168700bbb 100644
+--- a/core/libs/prx/libkernel/File/src/Open.cpp
++++ b/core/libs/prx/libkernel/File/src/Open.cpp
+@@ -62,7 +62,7 @@ static std::int64_t NativeLseek(int fd, std::int64_t offset, int whence) {
+     }
+     return ::_lseeki64(fd, offset, whence);
+ }
+-static int NativeRead(int fd, void* buf, std::size_t n) {
++static std::int64_t NativeRead(int fd, void* buf, std::size_t n) {
+     if (n > static_cast<std::size_t>(std::numeric_limits<unsigned int>::max())) {
+         throw std::runtime_error("sceKernelRead: nbytes exceeds platform limit");
+     }
+@@ -71,25 +71,20 @@ static int NativeRead(int fd, void* buf, std::size_t n) {
+         return -1;
+     }
+     const auto positioned = File::LockPositionedTransfer(fd);
+-    const int result = ::_read(fd, buf, static_cast<unsigned int>(n));
+-    if (result < 0 && _doserrno == ERROR_NO_DATA) errno = EAGAIN;
+-    return result;
++    return File::NativeDescriptorIo_nid_no_patch(fd, buf, n, false);
+ }
+-static int NativeWrite(int fd, const void* buf, std::size_t n) {
++static std::int64_t NativeWrite(int fd, const void* buf, std::size_t n) {
+     if (n > static_cast<std::size_t>(std::numeric_limits<unsigned int>::max())) {
+         throw std::runtime_error("sceKernelWrite: nbytes exceeds platform limit");
+     }
+     const auto positioned = File::LockPositionedTransfer(fd);
+     const auto shared = File::WriteSharedMemory_nid_no_patch(fd, buf, n);
+-    if (shared != -2) return static_cast<int>(shared);
++    if (shared != -2) return shared;
+     if (File::Appends(fd)) {
+         const auto appended = File::WriteAtEnd(fd, buf, n);
+-        if (appended != -2) return static_cast<int>(appended);
++        if (appended != -2) return appended;
+     }
+-    const int result = ::_write(fd, buf, static_cast<unsigned int>(n));
+-    if (result < 0 && errno == ENOSPC && _doserrno == 0 && ::GetFileType(reinterpret_cast<HANDLE>(::_get_osfhandle(fd))) == FILE_TYPE_PIPE) errno = EAGAIN;
+-    if (result < 0 && (_doserrno == ERROR_NO_DATA || _doserrno == ERROR_BROKEN_PIPE) && ::GetFileType(reinterpret_cast<HANDLE>(::_get_osfhandle(fd))) == FILE_TYPE_PIPE) errno = EPIPE;
+-    return result;
++    return File::NativeDescriptorIo_nid_no_patch(fd, const_cast<void*>(buf), n, true);
+ }
+ extern "C" _invalid_parameter_handler _set_thread_local_invalid_parameter_handler(_invalid_parameter_handler);
+ static void IgnoreInvalidParameter(const wchar_t*, const wchar_t*, const wchar_t*, unsigned int, std::uintptr_t) {}
+diff --git a/core/libs/prx/libkernel/File/src/Stdio.cpp b/core/libs/prx/libkernel/File/src/Stdio.cpp
+index b94988ef1f..809e6a27da 100644
+--- a/core/libs/prx/libkernel/File/src/Stdio.cpp
++++ b/core/libs/prx/libkernel/File/src/Stdio.cpp
+@@ -261,6 +261,44 @@ void File::SharePositionedTransfer(int from, int to) {
+     if (!source) source = std::make_shared<PositionedLock>();
+     g_positionedLocks[to] = source;
+ }
++// Stage transfers through host memory when direct kernel I/O hits ERROR_NOACCESS
++// on GPU write/read-watched guest pages so user-mode VEH handlers can unprotect them.
++static bool BouncePositionedTransfer(HANDLE handle, void* buf, DWORD nbytes, std::uint64_t at, bool write, bool append, DWORD& done, DWORD& error) {
++    constexpr std::size_t chunkLimit = 64u * 1024u;
++    if (write && append) {
++        std::vector<char> staging(nbytes);
++        std::memcpy(staging.data(), buf, nbytes);
++        OVERLAPPED overlapped{};
++        overlapped.Offset = static_cast<DWORD>(at);
++        overlapped.OffsetHigh = static_cast<DWORD>(at >> 32u);
++        const BOOL ok = ::WriteFile(handle, staging.data(), nbytes, &done, &overlapped);
++        error = ok ? ERROR_SUCCESS : ::GetLastError();
++        return ok != FALSE;
++    }
++    std::vector<char> staging(std::min<std::size_t>(nbytes, chunkLimit));
++    DWORD totalDone = 0;
++    BOOL ok = TRUE;
++    error = ERROR_SUCCESS;
++    while (totalDone < nbytes) {
++        const DWORD chunk = static_cast<DWORD>(std::min<std::size_t>(nbytes - totalDone, staging.size()));
++        if (write) std::memcpy(staging.data(), static_cast<const char*>(buf) + totalDone, chunk);
++        OVERLAPPED chunkOverlapped{};
++        const std::uint64_t chunkAt = at + totalDone;
++        chunkOverlapped.Offset = static_cast<DWORD>(chunkAt);
++        chunkOverlapped.OffsetHigh = static_cast<DWORD>(chunkAt >> 32u);
++        DWORD chunkDone = 0;
++        ok = write ? ::WriteFile(handle, staging.data(), chunk, &chunkDone, &chunkOverlapped)
++                   : ::ReadFile(handle, staging.data(), chunk, &chunkDone, &chunkOverlapped);
++        error = ok ? ERROR_SUCCESS : ::GetLastError();
++        if (!write && chunkDone != 0) std::memcpy(static_cast<char*>(buf) + totalDone, staging.data(), chunkDone);
++        totalDone += chunkDone;
++        if (!ok || chunkDone < chunk) break;
++    }
++    done = totalDone;
++    if (!ok && !write && error == ERROR_HANDLE_EOF && done > 0) ok = TRUE;
++    return ok != FALSE;
++}
++
+ static std::int64_t NativePositionedTransfer(int descriptor, void* buf, std::size_t nbytes, std::int64_t offset, bool write) {
+     if (nbytes > static_cast<std::size_t>(std::numeric_limits<DWORD>::max())) {
+         throw std::runtime_error("NativePositioned: nbytes exceeds platform limit");
+@@ -283,14 +321,18 @@ static std::int64_t NativePositionedTransfer(int descriptor, void* buf, std::siz
+         errno = ESPIPE;
+         return -1;
+     }
+-    const auto at = write && File::Appends(descriptor) ? ~std::uint64_t{} : static_cast<std::uint64_t>(offset);
++    const bool append = write && File::Appends(descriptor);
++    const auto at = append ? ~std::uint64_t{} : static_cast<std::uint64_t>(offset);
+     OVERLAPPED overlapped{};
+     overlapped.Offset = static_cast<DWORD>(at);
+     overlapped.OffsetHigh = static_cast<DWORD>(at >> 32u);
+     DWORD done = 0;
+-    const BOOL ok = write ? ::WriteFile(handle, buf, static_cast<DWORD>(nbytes), &done, &overlapped)
+-                          : ::ReadFile(handle, buf, static_cast<DWORD>(nbytes), &done, &overlapped);
+-    const DWORD error = ok ? ERROR_SUCCESS : ::GetLastError();
++    bool ok = (write ? ::WriteFile(handle, buf, static_cast<DWORD>(nbytes), &done, &overlapped)
++                     : ::ReadFile(handle, buf, static_cast<DWORD>(nbytes), &done, &overlapped)) != FALSE;
++    DWORD error = ok ? ERROR_SUCCESS : ::GetLastError();
++    if (!ok && error == ERROR_NOACCESS && nbytes != 0) {
++        ok = BouncePositionedTransfer(handle, buf, static_cast<DWORD>(nbytes), at, write, append, done, error);
++    }
+     if (!::SetFilePointerEx(handle, position, nullptr, FILE_BEGIN)) {
+         throw std::runtime_error("NativePositioned: cannot restore the file offset");
+     }
+@@ -326,6 +368,44 @@ std::int64_t File::WriteAtEnd(int descriptor, const void* buf, std::size_t nbyte
+     }
+     return done;
+ }
++static std::int64_t BounceSequentialTransfer(int descriptor, void* buf, std::size_t nbytes, bool write) {
++    constexpr std::size_t chunkLimit = 64u * 1024u;
++    std::vector<char> staging(std::min<std::size_t>(nbytes, chunkLimit));
++    std::size_t totalDone = 0;
++    while (totalDone < nbytes) {
++        const unsigned int chunk = static_cast<unsigned int>(std::min<std::size_t>(nbytes - totalDone, staging.size()));
++        if (write) std::memcpy(staging.data(), static_cast<const char*>(buf) + totalDone, chunk);
++        const int chunkDone = write ? ::_write(descriptor, staging.data(), chunk)
++                                    : ::_read(descriptor, staging.data(), chunk);
++        if (chunkDone < 0) return totalDone > 0 ? static_cast<std::int64_t>(totalDone) : -1;
++        if (!write && chunkDone > 0) std::memcpy(static_cast<char*>(buf) + totalDone, staging.data(), static_cast<std::size_t>(chunkDone));
++        totalDone += static_cast<std::size_t>(chunkDone);
++        if (chunkDone == 0 || static_cast<unsigned int>(chunkDone) < chunk) break;
++    }
++    return static_cast<std::int64_t>(totalDone);
++}
++
++std::int64_t File::NativeDescriptorIo_nid_no_patch(int descriptor, void* buf, std::size_t nbytes, bool write) {
++    const auto handle = reinterpret_cast<HANDLE>(WithoutParameterHandler([descriptor] { return ::_get_osfhandle(descriptor); }));
++    LARGE_INTEGER savedPos{};
++    const bool hasSavedPos = handle != INVALID_HANDLE_VALUE && ::GetFileType(handle) == FILE_TYPE_DISK && ::SetFilePointerEx(handle, LARGE_INTEGER{}, &savedPos, FILE_CURRENT);
++    const int result = write ? ::_write(descriptor, buf, static_cast<unsigned int>(nbytes))
++                             : ::_read(descriptor, buf, static_cast<unsigned int>(nbytes));
++    if (result < 0 && nbytes != 0 && (_doserrno == ERROR_NOACCESS || ::GetLastError() == ERROR_NOACCESS)) {
++        if (hasSavedPos && !::SetFilePointerEx(handle, savedPos, nullptr, FILE_BEGIN)) {
++            errno = EIO;
++            return -1;
++        }
++        return BounceSequentialTransfer(descriptor, buf, nbytes, write);
++    }
++    if (!write && result < 0 && _doserrno == ERROR_NO_DATA) errno = EAGAIN;
++    if (write && result < 0 && handle != INVALID_HANDLE_VALUE && ::GetFileType(handle) == FILE_TYPE_PIPE) {
++        if (errno == ENOSPC && _doserrno == 0) errno = EAGAIN;
++        else if (_doserrno == ERROR_NO_DATA || _doserrno == ERROR_BROKEN_PIPE) errno = EPIPE;
++    }
++    return result;
++}
++
+ static std::int64_t NativeTransferBuffer(int descriptor, void* buf, std::size_t nbytes, bool write) {
+     if (nbytes > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+         throw std::runtime_error("NativeTransfer: nbytes exceeds platform limit");
+@@ -338,10 +418,7 @@ static std::int64_t NativeTransferBuffer(int descriptor, void* buf, std::size_t
+             if (appended != -2) return appended;
+         }
+     }
+-    if (!write) return ::_read(descriptor, buf, static_cast<unsigned int>(nbytes));
+-    const int result = ::_write(descriptor, buf, static_cast<unsigned int>(nbytes));
+-    if (result < 0 && (_doserrno == ERROR_NO_DATA || _doserrno == ERROR_BROKEN_PIPE) && ::GetFileType(reinterpret_cast<HANDLE>(::_get_osfhandle(descriptor))) == FILE_TYPE_PIPE) errno = EPIPE;
+-    return result;
++    return File::NativeDescriptorIo_nid_no_patch(descriptor, buf, nbytes, write);
+ }
+ static std::int64_t NativeTransfer(int descriptor, void* buf, std::size_t nbytes, bool write) {
+     const auto positioned = File::LockPositionedTransfer(descriptor);
+diff --git a/core/libs/tests/GuestAudioPropagation.cpp b/core/libs/tests/GuestAudioPropagation.cpp
+index 7c3df84185..065446f20e 100644
+--- a/core/libs/tests/GuestAudioPropagation.cpp
++++ b/core/libs/tests/GuestAudioPropagation.cpp
+@@ -223,9 +223,10 @@ int main() {
+     RequireThrows<std::runtime_error>([&] { sceAudioPropagationSystemSetRays(system, rays, 1); }, "unrequested ray results");
+     Require(sceAudioPropagationSourceCalculateAudioPaths(source, rays, 0, 1, nullptr, 0) == AudioPropagation::ErrorNullPointer, "path calculation null output");
+     Require(sceAudioPropagationSourceCalculateAudioPaths(0, nullptr, 0, 0, nullptr, 0) == AudioPropagation::ErrorInvalidHandle, "path calculation handle precedence");
+-    Require(sceAudioPropagationSourceCalculateAudioPaths(source, rays, 0, 1, rays, 6) == AudioPropagation::ErrorInvalidArgument, "path calculation empty rays");
+-    Require(sceAudioPropagationSourceCalculateAudioPaths(source, rays, 6, 0, rays, 6) == AudioPropagation::ErrorInvalidArgument, "path calculation zero reflection order");
+-    Require(sceAudioPropagationSourceCalculateAudioPaths(source, rays, 6, 1, rays, 0) == AudioPropagation::ErrorInvalidArgument, "path calculation zero output capacity");
++    Require(sceAudioPropagationSourceCalculateAudioPaths(source, rays, 0, 1, rays, 6) == 0, "path calculation empty rays");
++    Require(sceAudioPropagationSourceCalculateAudioPaths(source, rays, 6, 0, rays, 6) == 0, "path calculation zero flags");
++    Require(sceAudioPropagationSourceCalculateAudioPaths(source, rays, 6, 1, rays, 0) == 0, "path calculation zero output capacity");
++    Require(sceAudioPropagationSourceCalculateAudioPaths(source, rays, 2, 0, rays, 2) == 0, "path calculation non-6 ray count");
+     Require(sceAudioPropagationSourceSetAudioPaths(source, nullptr, 0) == 0, "empty audio paths failed");
+     RequireThrows<std::runtime_error>([&] { sceAudioPropagationSourceSetAudioPaths(source, rays, 1); }, "set audio paths");
+ 
+diff --git a/core/libs/tests/GuestStdioFaultRead.cpp b/core/libs/tests/GuestStdioFaultRead.cpp
+new file mode 100644
+index 0000000000..2ce712cb6e
+--- /dev/null
++++ b/core/libs/tests/GuestStdioFaultRead.cpp
+@@ -0,0 +1,165 @@
++#include "prx/libkernel/include/Api.hpp"
++#include "prx/libc/include/Api.hpp"
++#include "prx/libc/include/general/VabiMacros.hpp"
++#include <algorithm>
++#include <array>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <stdexcept>
++#include <string>
++#include <vector>
++#ifdef _WIN32
++#include <windows.h>
++#endif
++
++namespace {
++
++constexpr std::size_t FileBytes = (192u << 10u) + 37u;
++constexpr const char* FilePath = "stdio_fault_read_generated.bin";
++
++void Require(bool condition, const char* message) {
++    if (!condition) throw std::runtime_error(message);
++}
++
++std::uint8_t PatternByte(std::size_t index) {
++    return static_cast<std::uint8_t>((index * 41u) ^ (index >> 7u) ^ (index >> 13u));
++}
++
++void VerifyPattern(const std::uint8_t* data, std::size_t startOffset, std::size_t count) {
++    for (std::size_t i = 0; i < count; ++i) {
++        if (data[i] != PatternByte(startOffset + i)) {
++            throw std::runtime_error("read content mismatch at offset " + std::to_string(startOffset + i));
++        }
++    }
++}
++
++#ifdef _WIN32
++std::uintptr_t g_guardBegin = 0;
++std::size_t g_guardBytes = 0;
++std::size_t g_guardPage = 0;
++std::size_t g_faultedPages = 0;
++
++LONG CALLBACK UnprotectOnWrite(EXCEPTION_POINTERS* exception) {
++    const auto& record = *exception->ExceptionRecord;
++    if (record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record.NumberParameters < 2 || record.ExceptionInformation[0] != 1) {
++        return EXCEPTION_CONTINUE_SEARCH;
++    }
++    const auto address = static_cast<std::uintptr_t>(record.ExceptionInformation[1]);
++    if (address < g_guardBegin || address - g_guardBegin >= g_guardBytes) {
++        return EXCEPTION_CONTINUE_SEARCH;
++    }
++    const auto page = address & ~(static_cast<std::uintptr_t>(g_guardPage) - 1);
++    DWORD previous = 0;
++    if (!VirtualProtect(reinterpret_cast<void*>(page), g_guardPage, PAGE_READWRITE, &previous)) {
++        return EXCEPTION_CONTINUE_SEARCH;
++    }
++    ++g_faultedPages;
++    return EXCEPTION_CONTINUE_EXECUTION;
++}
++
++class ReadOnlyFaultBuffer {
++public:
++    explicit ReadOnlyFaultBuffer(std::size_t bytes) : bytes(bytes) {
++        SYSTEM_INFO system{};
++        GetSystemInfo(&system);
++        pageSize = system.dwPageSize;
++        buffer = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
++        Require(buffer != nullptr, "cannot allocate fault test buffer");
++        handler = AddVectoredExceptionHandler(1, UnprotectOnWrite);
++        if (handler == nullptr) {
++            VirtualFree(buffer, 0, MEM_RELEASE);
++            throw std::runtime_error("cannot install vectored exception handler");
++        }
++        g_guardBegin = reinterpret_cast<std::uintptr_t>(buffer);
++        g_guardBytes = bytes;
++        g_guardPage = pageSize;
++        ProtectReadOnly();
++    }
++
++    ~ReadOnlyFaultBuffer() {
++        g_guardBytes = 0;
++        if (handler != nullptr) RemoveVectoredExceptionHandler(handler);
++        if (buffer != nullptr) VirtualFree(buffer, 0, MEM_RELEASE);
++    }
++
++    void ProtectReadOnly() {
++        DWORD previous = 0;
++        Require(VirtualProtect(buffer, bytes, PAGE_READWRITE, &previous) != FALSE, "cannot reset buffer writable");
++        std::memset(buffer, 0xCC, bytes);
++        g_faultedPages = 0;
++        Require(VirtualProtect(buffer, bytes, PAGE_READONLY, &previous) != FALSE, "cannot mark buffer PAGE_READONLY");
++    }
++
++    std::uint8_t* Data() const { return buffer; }
++
++private:
++    std::size_t bytes = 0;
++    std::size_t pageSize = 0;
++    std::uint8_t* buffer = nullptr;
++    void* handler = nullptr;
++};
++#endif
++
++} // namespace
++
++int main() {
++    try {
++        {
++            std::ofstream stream(FilePath, std::ios::binary | std::ios::trunc);
++            std::array<char, 65536> chunk{};
++            for (std::size_t offset = 0; offset < FileBytes; offset += chunk.size()) {
++                const auto count = std::min(chunk.size(), FileBytes - offset);
++                for (std::size_t i = 0; i < count; ++i) chunk[i] = static_cast<char>(PatternByte(offset + i));
++                stream.write(chunk.data(), static_cast<std::streamsize>(count));
++            }
++            stream.close();
++            Require(!stream.fail(), "cannot create test file");
++        }
++
++#ifdef _WIN32
++        ReadOnlyFaultBuffer faultBuffer(FileBytes + 4096u);
++        const int fd = open_nid_postfix(FilePath, 0, 0);
++        Require(fd >= 0, "cannot open generated file via libkernel");
++
++        // 1. Positioned read (sceKernelPread -> NativePositionedTransfer) into PAGE_READONLY pages
++        Require(lseek_nid_postfix(fd, 13, 0) == 13, "cannot seek before pread");
++        const auto preadCount = sceKernelPread(fd, faultBuffer.Data(), FileBytes - 7u, 7);
++        Require(preadCount == static_cast<std::int64_t>(FileBytes - 7u), "sceKernelPread on PAGE_READONLY failed");
++        Require(g_faultedPages >= 3, "sceKernelPread did not trigger VEH on PAGE_READONLY pages");
++        Require(lseek_nid_postfix(fd, 0, 1) == 13, "sceKernelPread modified file position");
++        VerifyPattern(faultBuffer.Data(), 7, FileBytes - 7u);
++
++        // 2. Sequential read (read_nid_postfix -> NativeTransferBuffer) into PAGE_READONLY pages
++        faultBuffer.ProtectReadOnly();
++        Require(lseek_nid_postfix(fd, 5, 0) == 5, "cannot seek before sequential read");
++        const auto readCount = read_nid_postfix(fd, faultBuffer.Data(), FileBytes - 5u);
++        Require(readCount == static_cast<std::int64_t>(FileBytes - 5u), "read_nid_postfix on PAGE_READONLY failed");
++        Require(g_faultedPages >= 3, "read_nid_postfix did not trigger VEH on PAGE_READONLY pages");
++        VerifyPattern(faultBuffer.Data(), 5, FileBytes - 5u);
++        Require(close_nid_postfix(fd) == 0, "cannot close descriptor");
++
++        // 3. Buffered stdio fread (fread -> NativeTransferBuffer) into PAGE_READONLY pages
++        faultBuffer.ProtectReadOnly();
++        FileStream* stream = fopen_nid_postfix(FilePath, "rb");
++        Require(stream != nullptr, "cannot fopen generated file");
++        const auto freadCount = fread_nid_postfix(faultBuffer.Data(), 1, FileBytes, stream);
++        Require(freadCount == FileBytes, "fread_nid_postfix on PAGE_READONLY failed");
++        Require(g_faultedPages >= 3, "fread_nid_postfix did not trigger VEH on PAGE_READONLY pages");
++        VerifyPattern(faultBuffer.Data(), 0, FileBytes);
++        Require(fclose_nid_postfix(stream) == 0, "cannot fclose stream");
++#endif
++
++        std::error_code ignored;
++        std::filesystem::remove(FilePath, ignored);
++        std::puts("Stdio PAGE_READONLY bounce checks passed");
++        return 0;
++    } catch (const std::exception& error) {
++        std::error_code ignored;
++        std::filesystem::remove(FilePath, ignored);
++        std::fprintf(stderr, "GuestStdioFaultRead failed: %s\n", error.what());
++        return 1;
++    }
++}
+-- 
+2.55.0.windows.5
+

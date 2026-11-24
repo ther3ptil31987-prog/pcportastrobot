@@ -20,6 +20,7 @@ namespace AstroHybrid.App.ViewModels
             ChangeLocationCommand = new RelayCommand(() => _mainViewModel.ChangeInstallLocationCommand.Execute(null));
             OpenInstallFolderCommand = new RelayCommand(() => _mainViewModel.OpenInstallFolderCommand.Execute(null));
             OpenLogFolderCommand = new RelayCommand(() => _mainViewModel.OpenLogFolderCommand.Execute(null));
+            ExportSupportLogsCommand = new RelayCommand(() => _mainViewModel.ExportSupportLogsCommand.Execute(null));
             UninstallCommand = new RelayCommand(() => _mainViewModel.UninstallCommand.Execute(null));
             RunSetupAgainCommand = new RelayCommand(RunSetupAgain);
         }
@@ -42,15 +43,18 @@ namespace AstroHybrid.App.ViewModels
 
         public bool IsInstalled => _mainViewModel.InstallationState?.IsInstalled == true;
 
-        public string AnyPs5Version => _mainViewModel.Settings.InstallationManifest?.AnyPs5Version ?? "Unknown";
+        public string AnyPs5Version =>
+            (_mainViewModel.InstallationState?.Manifest ?? _mainViewModel.Settings.InstallationManifest)?.AnyPs5Version ?? "Unknown";
 
-        public string KytyVersion => _mainViewModel.Settings.InstallationManifest?.KytyVersion ?? "Unknown";
+        public string KytyVersion =>
+            (_mainViewModel.InstallationState?.Manifest ?? _mainViewModel.Settings.InstallationManifest)?.KytyVersion ?? "Unknown";
 
         public ICommand RepairCommand { get; }
         public ICommand RebuildCommand { get; }
         public ICommand ChangeLocationCommand { get; }
         public ICommand OpenInstallFolderCommand { get; }
         public ICommand OpenLogFolderCommand { get; }
+        public ICommand ExportSupportLogsCommand { get; }
         public ICommand UninstallCommand { get; }
         public ICommand RunSetupAgainCommand { get; }
 

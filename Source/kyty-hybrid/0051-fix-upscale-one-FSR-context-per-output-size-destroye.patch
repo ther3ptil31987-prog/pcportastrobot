@@ -1,0 +1,197 @@
+From 5920f2fb46ebf88156a968ef80e88ab43754a07f Mon Sep 17 00:00:00 2001
+From: Codex <local@invalid>
+Date: Sat, 21 Nov 2026 16:17:29 +0000
+Subject: [PATCH] fix(upscale): one FSR context per output size, destroyed only
+ after the GPU is done
+
+The game runs its temporal upscale pass at two output sizes around level changes (a full-screen pass
+and a native-size one). The single FSR context was replaced at every switch: device wait, then destroy,
+while the command buffer being recorded still held dispatches of that context. The GPU then wrote
+through freed memory (device fault: WriteInvalid at 0x0), the device was lost and the game exited with
+321 when leaving a planet. Each output size now has its own context (up to four, the least recently used
+one replaced), created for inputs up to its output size, and a replaced context is destroyed by a
+deferred operation after the current command buffer completes. Frame continuity (reset, frame time) is
+tracked per context.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/graphics/host_gpu/renderer/fsr.inc | 114 +++++++++++++++++++------
+ 1 file changed, 87 insertions(+), 27 deletions(-)
+
+diff --git a/src/graphics/host_gpu/renderer/fsr.inc b/src/graphics/host_gpu/renderer/fsr.inc
+index 85ca6be3..3cf3feb8 100644
+--- a/src/graphics/host_gpu/renderer/fsr.inc
++++ b/src/graphics/host_gpu/renderer/fsr.inc
+@@ -19,6 +19,20 @@ bool Requested() {
+ 
+ namespace {
+ 
++#if KYTY_FFX
++// One FSR context for one output size (see TryFsrUpscale).
++struct FsrSlot {
++	ffxContext context      = nullptr;
++	uint32_t   in_w         = 0;
++	uint32_t   in_h         = 0;
++	uint32_t   out_w        = 0;
++	uint32_t   out_h        = 0;
++	uint32_t   last_frame   = 0;
++	int64_t    last_eval_ns = 0;
++	uint64_t   last_use     = 0;
++};
++#endif
++
+ struct FsrState {
+ 	bool                     init_tried = false;
+ 	bool                     ready      = false;
+@@ -28,7 +42,8 @@ struct FsrState {
+ #if KYTY_FFX
+ 	HMODULE                  module     = nullptr;
+ 	ffxFunctions             api {};
+-	ffxContext               context    = nullptr;
++	std::array<FsrSlot, 4>   slots {};
++	uint64_t                 use_counter = 0;
+ 	std::vector<uint64_t>    version_ids;
+ 	std::vector<std::string> version_names;
+ 	size_t                   version_index = 0;
+@@ -242,18 +257,56 @@ bool RenderExecutor::TryFsrUpscale(CommandBuffer& buffer, PreparedBindings& pixe
+ 
+ 	buffer.EndRendering();
+ 	const auto cmd = buffer.Handle();
+-	// The context is created for the largest sizes seen; the game's dynamic resolution changes the
+-	// input size from frame to frame within it (FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION).
+-	if (s.context == nullptr || in_w > s.in_w || in_h > s.in_h || out_w != s.out_w || out_h != s.out_h) {
+-		const uint32_t max_w = std::max(in_w, s.out_w == out_w ? s.in_w : 0u);
+-		const uint32_t max_h = std::max(in_h, s.out_h == out_h ? s.in_h : 0u);
+-		if (s.context != nullptr) {
+-			// The GPU may still use the old context's resources: wait for it before destroying it.
+-			graphics.device.waitIdle();
+-			s.api.DestroyContext(&s.context, nullptr);
+-			s.context = nullptr;
++	// One context per output size. The game runs this pass at more than one output size (around
++	// level changes a full-screen pass alternates with a native-size one), and replacing a single
++	// context made the GPU run dispatches of a context destroyed while this command buffer still held
++	// them (a write to freed memory, device lost, exit 321). Each context covers inputs up to its
++	// output size (the game's dynamic resolution moves the input within it,
++	// FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION), and a context is only ever destroyed after the command
++	// buffer recorded now (submitted after every earlier one) has completed.
++	const auto retire = [&](FsrSlot& old) {
++		if (old.context != nullptr) {
++			ffxContext old_context = old.context;
++			auto       destroy     = s.api.DestroyContext;
++			m_context.GetCommandScheduler().DeferOperation([old_context, destroy]() mutable {
++				destroy(&old_context, nullptr);
++			});
++		}
++		old = FsrSlot {};
++	};
++	FsrSlot* slot = nullptr;
++	for (auto& candidate: s.slots) {
++		if (candidate.context != nullptr && candidate.out_w == out_w && candidate.out_h == out_h) {
++			slot = &candidate;
++			break;
++		}
++	}
++	if (slot != nullptr && (in_w > slot->in_w || in_h > slot->in_h)) {
++		retire(*slot);
++	}
++	if (slot == nullptr || slot->context == nullptr) {
++		const uint32_t max_w = std::max(in_w, out_w);
++		const uint32_t max_h = std::max(in_h, out_h);
++		if (slot == nullptr) {
++			// An empty slot, else the one used longest ago.
++			for (auto& candidate: s.slots) {
++				if (candidate.context == nullptr) {
++					slot = &candidate;
++					break;
++				}
++			}
++			if (slot == nullptr) {
++				slot = &s.slots[0];
++				for (auto& candidate: s.slots) {
++					if (candidate.last_use < slot->last_use) {
++						slot = &candidate;
++					}
++				}
++				retire(*slot);
++			}
+ 		}
+-		while (s.context == nullptr && s.version_index < s.version_ids.size()) {
++		ffxContext created = nullptr;
++		while (created == nullptr && s.version_index < s.version_ids.size()) {
+ 			ffxCreateBackendVKDesc backend {};
+ 			backend.header.type   = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
+ 			backend.deviceContext = s.device_context;
+@@ -271,13 +324,13 @@ bool RenderExecutor::TryFsrUpscale(CommandBuffer& buffer, PreparedBindings& pixe
+ 			create.maxRenderSize  = {max_w, max_h};
+ 			create.maxUpscaleSize = {out_w, out_h};
+ 			create.fpMessage      = FfxMessage;
+-			const auto result     = s.api.CreateContext(&s.context, &create.header, nullptr);
+-			if (result != FFX_API_RETURN_OK || s.context == nullptr) {
++			const auto result     = s.api.CreateContext(&created, &create.header, nullptr);
++			if (result != FFX_API_RETURN_OK || created == nullptr) {
+ 				std::printf("FSR: %s could not be created (%u) for %ux%u -> %ux%u; trying the next version\n",
+ 				            s.version_names[s.version_index].c_str(), static_cast<unsigned>(result), max_w,
+ 				            max_h, out_w, out_h);
+ 				std::fflush(stdout);
+-				s.context = nullptr;
++				created = nullptr;
+ 				s.version_index++;
+ 				continue;
+ 			}
+@@ -288,15 +341,21 @@ bool RenderExecutor::TryFsrUpscale(CommandBuffer& buffer, PreparedBindings& pixe
+ 			std::fflush(stdout);
+ 		}
+ 		buffer.ForgetBoundState();
+-		if (s.context == nullptr) {
++		if (created == nullptr) {
+ 			s.ready = false;
+ 			return FsrFail(s, Fallback::CreateFailed);
+ 		}
+-		s.in_w  = max_w;
+-		s.in_h  = max_h;
+-		s.out_w = out_w;
+-		s.out_h = out_h;
++		slot->context = created;
++		slot->in_w    = max_w;
++		slot->in_h    = max_h;
++		slot->out_w   = out_w;
++		slot->out_h   = out_h;
+ 	}
++	slot->last_use = ++s.use_counter;
++	s.in_w         = in_w;
++	s.in_h         = in_h;
++	s.out_w        = out_w;
++	s.out_h        = out_h;
+ 
+ 	mv.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderSampledRead, {}, cmd);
+ 	color.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderSampledRead, {},
+@@ -324,18 +383,19 @@ bool RenderExecutor::TryFsrUpscale(CommandBuffer& buffer, PreparedBindings& pixe
+ 	dispatch.upscaleSize       = {out_w, out_h};
+ 	dispatch.enableSharpening  = s.sharpness > 0.0f;
+ 	dispatch.sharpness         = s.sharpness;
+-	dispatch.frameTimeDelta =
+-	    s.last_eval_ns != 0 ? std::clamp(static_cast<float>(now - s.last_eval_ns) / 1.0e6f, 1.0f, 100.0f)
+-	                        : 16.7f;
++	// Each context keeps its own history, so frame continuity is tracked per context.
++	dispatch.frameTimeDelta = slot->last_eval_ns != 0
++	                              ? std::clamp(static_cast<float>(now - slot->last_eval_ns) / 1.0e6f, 1.0f, 100.0f)
++	                              : 16.7f;
+ 	dispatch.preExposure             = 1.0f;
+-	dispatch.reset                   = s.last_frame != 0 && frame != s.last_frame + 1;
++	dispatch.reset                   = slot->last_frame == 0 || frame != slot->last_frame + 1;
+ 	dispatch.cameraNear              = 0.1f;
+ 	dispatch.cameraFar               = 10000.0f;
+ 	dispatch.cameraFovAngleVertical  = 1.0472f;
+ 	dispatch.viewSpaceToMetersFactor = 1.0f;
+-	s.last_frame   = frame;
+-	s.last_eval_ns = now;
+-	const auto result = s.api.Dispatch(&s.context, &dispatch.header);
++	slot->last_frame   = frame;
++	slot->last_eval_ns = now;
++	const auto result = s.api.Dispatch(&slot->context, &dispatch.header);
+ 	buffer.ForgetBoundState();
+ 	if (result != FFX_API_RETURN_OK) {
+ 		static std::atomic<uint32_t> logged {0};
+-- 
+2.55.0.windows.5
+

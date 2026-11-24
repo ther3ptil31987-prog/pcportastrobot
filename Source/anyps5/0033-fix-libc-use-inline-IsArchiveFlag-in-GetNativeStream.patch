@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AstroHybrid <noreply@localhost>
+Date: Sun, 22 Nov 2026 20:57:18 +0000
+Subject: [PATCH] fix(libc): use inline IsArchiveFlag in GetNativeStream so
+ libSceLibcInternal does not import unexported FileStream::IsArchive
+
+---
+ core/libs/prx/libc/include/FileStream.hpp | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/core/libs/prx/libc/include/FileStream.hpp b/core/libs/prx/libc/include/FileStream.hpp
+index 0108640afb..986d203b13 100644
+--- a/core/libs/prx/libc/include/FileStream.hpp
++++ b/core/libs/prx/libc/include/FileStream.hpp
+@@ -76,6 +76,7 @@ class FileStream {
+ 
+ public:
+     bool IsArchive();
++    bool IsArchiveFlag() const { return archiveDescriptor >= 0; }
+     void MarkArchive();
+     void DetachArchive();
+     std::size_t ReadArchive(void* buffer, std::size_t bytes);
+@@ -272,13 +273,13 @@ public:
+     }
+     void SyncStatus() {
+         if (!_handle) return;
+-        if (IsArchive()) { PublishStatus(archiveEnd, guestError); return; }
++        if (IsArchiveFlag()) { PublishStatus(archiveEnd, guestError); return; }
+         PublishStatus(std::feof(GetHandle()) != 0, std::ferror(GetHandle()) != 0 || guestError);
+     }
+ 
+     void SyncUnlockedStatus() {
+         if (!_handle) return;
+-        if (IsArchive()) { PublishStatus(archiveEnd, guestError); return; }
++        if (IsArchiveFlag()) { PublishStatus(archiveEnd, guestError); return; }
+ #ifdef _WIN32
+         const bool endOfFile = std::feof(GetHandle()) != 0;
+         const bool error = std::ferror(GetHandle()) != 0;
+@@ -406,7 +407,7 @@ inline std::FILE* GetStreamHandle(FileStream* stream) {
+ inline std::FILE* GetNativeStream(FileStream* stream) {
+     auto* handle = GetStreamHandle(stream);
+     if (stream->IsRandomDevice()) throw std::runtime_error("FileStream: this function is not implemented on a /dev/random or /dev/urandom stream");
+-    if (stream->IsArchive()) throw std::runtime_error("FileStream: this function is not implemented on an app0.zar stream");
++    if (stream->IsArchiveFlag()) throw std::runtime_error("FileStream: this function is not implemented on an app0.zar stream");
+     return handle;
+ }
+ 
+-- 
+2.55.0.windows.5
+

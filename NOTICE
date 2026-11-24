@@ -1,0 +1,16 @@
+AstroHybrid — Astro Bot (PPSA21567) Native PC Port
+Copyright (c) 2026 imnotsharingmyname
+
+Official repository:
+https://github.com/imnotsharingmyname/pcportastrobot
+
+If you fork, modify, or redistribute builds or source code derived from this
+project, please retain this notice and clearly credit the original repository
+(imnotsharingmyname/pcportastrobot) in your README and release notes.
+
+Community contributors:
+- @mlmarcus (AMD FSR Frame Generation, Switch gyro zero-rate offset fix)
+- @LeungZ9 (ZArchive app0.zar dump support)
+
+Not affiliated with or endorsed by Sony Interactive Entertainment, Team ASOBI,
+NVIDIA, or AMD.

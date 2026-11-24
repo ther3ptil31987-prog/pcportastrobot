@@ -1,0 +1,35 @@
+From 7805af8ae41a567d2821ffca85f089fdcdd9e405 Mon Sep 17 00:00:00 2001
+From: Local Build <local@invalid>
+Date: Tue, 17 Nov 2026 02:50:12 +0000
+Subject: fix(wine): resolve optional CPU-set API dynamically
+
+---
+ src/common/cpuPlacement.cpp | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/src/common/cpuPlacement.cpp b/src/common/cpuPlacement.cpp
+index 66af9e79..ba8f40a5 100644
+--- a/src/common/cpuPlacement.cpp
++++ b/src/common/cpuPlacement.cpp
+@@ -490,10 +490,16 @@ namespace {
+ 
+ // The process default CPU sets now (sorted CPU set ids; empty: none assigned).
+ std::vector<ULONG> ProcessDefaultCpuSets() {
++	// Resolve dynamically so older Windows builds and Wine/Proton without Kernel32 export do not abort at load (#48, #59).
++	using GetProcessDefaultCpuSetsFn = BOOL(WINAPI*)(HANDLE, PULONG, ULONG, PULONG);
++	static const auto fn = reinterpret_cast<GetProcessDefaultCpuSetsFn>(
++	    GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetProcessDefaultCpuSets"));
++	if (!fn) {
++		return {};
++	}
+ 	std::vector<ULONG> ids(256);
+ 	ULONG              count = 0;
+-	if (GetProcessDefaultCpuSets(GetCurrentProcess(), ids.data(), static_cast<ULONG>(ids.size()),
+-	                             &count) == 0) {
++	if (fn(GetCurrentProcess(), ids.data(), static_cast<ULONG>(ids.size()), &count) == 0) {
+ 		count = 0;
+ 	}
+ 	ids.resize(count);
+-- 
+2.55.0.windows.5
+

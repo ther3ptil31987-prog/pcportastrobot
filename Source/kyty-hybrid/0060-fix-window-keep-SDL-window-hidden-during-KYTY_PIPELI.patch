@@ -1,0 +1,29 @@
+From 7e8463c1fda563e05886a6448ecdd69cf3f6c6a1 Mon Sep 17 00:00:00 2001
+From: Local Build <local@invalid>
+Date: Mon, 23 Nov 2026 18:27:08 +0000
+Subject: [PATCH] fix(window): keep SDL window hidden during
+ KYTY_PIPELINE_LIST_PREPARE
+
+---
+ src/graphics/presentation/window/window.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/graphics/presentation/window/window.cpp b/src/graphics/presentation/window/window.cpp
+index f95372cf..a46a3762 100644
+--- a/src/graphics/presentation/window/window.cpp
++++ b/src/graphics/presentation/window/window.cpp
+@@ -885,6 +885,11 @@ static void WindowCreate(WindowContext& context) {
+ 		window_flags |= static_cast<uint32_t>(SDL_WINDOW_BORDERLESS);
+ 	}
+ #endif
++	if (const auto* prep = std::getenv("KYTY_PIPELINE_LIST_PREPARE");
++	    prep != nullptr && *prep != '\0' && std::strcmp(prep, "0") != 0) {
++		window_flags |= static_cast<uint32_t>(SDL_WINDOW_HIDDEN);
++		window_flags &= ~static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN);
++	}
+ 	context.window = SDL_CreateWindow(KYTY_SDL_WINDOW_CAPTION, width, height, window_flags);
+ 
+ 	if (context.window == nullptr) {
+-- 
+2.55.0.windows.5
+

@@ -1,0 +1,42 @@
+From 3aa58287cd3d93f614127430d6abc28f70ebffe1 Mon Sep 17 00:00:00 2001
+From: Local Build <local@invalid>
+Date: Tue, 17 Nov 2026 02:28:02 +0000
+Subject: fix(avplayer): keep a stable audio-video clock
+
+---
+ src/libs/avPlayer.cpp | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/src/libs/avPlayer.cpp b/src/libs/avPlayer.cpp
+index 9302f3e3..25171eb7 100644
+--- a/src/libs/avPlayer.cpp
++++ b/src/libs/avPlayer.cpp
+@@ -1014,6 +1014,7 @@ public:
+ 		if (!frame) {
+ 			return false;
+ 		}
++		const bool first_audio_frame = !current_audio;
+ 		if (current_audio) {
+ 			audio_buffers.Push(std::move(current_audio->buffer));
+ 		}
+@@ -1026,9 +1027,14 @@ public:
+ 		out->details.audio.size          = current_audio->info.details.audio.size;
+ 		std::memcpy(out->details.audio.language_code,
+ 		            current_audio->info.details.audio.language_code, 4);
+-		start_time_ms = current_audio->info.time_stamp + current_audio->timestamp_offset;
+-		clock_start   = std::chrono::steady_clock::now();
+-		paused_extra  = {};
++		// The first decoded audio frame anchors a newly started/seeked stream. Do not
++		// reset the shared A/V clock for every audio callback: doing so makes video
++		// timing follow audio-buffer delivery jitter and desynchronizes cinematics.
++		if (first_audio_frame) {
++			start_time_ms = current_audio->info.time_stamp + current_audio->timestamp_offset;
++			clock_start   = std::chrono::steady_clock::now();
++			paused_extra  = {};
++		}
+ 		RecordLoopBoundary(*current_audio);
+ 		return true;
+ 	}
+-- 
+2.55.0.windows.5
+

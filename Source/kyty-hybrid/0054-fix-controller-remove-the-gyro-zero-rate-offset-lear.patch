@@ -1,0 +1,181 @@
+From cc63197da72c5c1cf56a7e424159471931830baf Mon Sep 17 00:00:00 2001
+From: davsar89 <17025345+davsar89@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 22:24:21 +0100
+Subject: fix(controller): remove the gyro zero-rate offset learned at rest
+
+SDL's Switch driver reads the pad's factory zero-rate offset but never
+subtracts it, so the game saw a constant rotation. A genuine Switch Pro
+Controller lying on a table read +5.0, -0.9, -1.9 deg/s (noise 0.05 deg/s),
+which made up/down motion drift while left/right was fine.
+
+libs/gyroBias.h learns the offset whenever the pad lies still for a second
+(gyro within 1 deg/s, smoothed gravity within 0.01 G) and Motion() removes
+it from every reading. The first value learned is logged per controller.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/libs/controller.cpp |  15 +++++-
+ src/libs/gyroBias.h     | 104 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 118 insertions(+), 1 deletion(-)
+ create mode 100644 src/libs/gyroBias.h
+
+diff --git a/src/libs/controller.cpp b/src/libs/controller.cpp
+index 57d6f099..c24edd32 100644
+--- a/src/libs/controller.cpp
++++ b/src/libs/controller.cpp
+@@ -11,6 +11,7 @@
+ #include "kernel/pthread.h"
+ #include "libs/dualSenseHaptics.h"
+ #include "libs/errno.h"
++#include "libs/gyroBias.h"
+ #include "libs/libs.h"
+ #include "libs/padData.h"
+ 
+@@ -177,6 +178,7 @@ private:
+ 	int              m_connected_count = 0;
+ 	bool             m_motion_enabled  = true;
+ 	uint64_t         m_gyro_time       = 0;
++	GyroBias         m_gyro_bias;
+ 	bool             m_gyro_emulation  = false;
+ 	uint64_t         m_emulated_time   = 0;
+ 	std::array<int, 2> m_emulated_stick {128, 128};
+@@ -592,6 +594,7 @@ void GameController::SetDevices(int active_id) {
+ 	m_connected     = new_connected;
+ 	m_state         = {};
+ 	m_gyro_time     = 0;
++	m_gyro_bias     = {};
+ 	m_gyro_emulation = false;
+ 	m_emulated_time  = 0;
+ 	m_emulated_stick = {128, 128};
+@@ -787,7 +790,17 @@ void GameController::Motion(int id, Sensor sensor, const float* data, uint64_t t
+ 			m_up_reference_valid = true;
+ 		}
+ 	} else {
+-		std::copy_n(data, 3, m_state.gyro.begin());
++		// Remove the pad's zero-rate offset, learned whenever it lies still (libs/gyroBias.h).
++		const bool learned_before = m_gyro_bias.Valid();
++		if (m_gyro_bias.Add(data, m_state.accel, time_us) && !learned_before) {
++			const auto& bias = m_gyro_bias.Value();
++			std::fprintf(stderr,
++			             "[astrohybrid 0] controller %d: gyro offset at rest %.2f %.2f %.2f deg/s, removed from now on\n",
++			             id, bias[0] * 57.29578f, bias[1] * 57.29578f, bias[2] * 57.29578f);
++		}
++		float gyro[3] {data[0], data[1], data[2]};
++		m_gyro_bias.Apply(gyro);
++		std::copy_n(gyro, 3, m_state.gyro.begin());
+ 		// Mahony tilt correction; heading is unobservable and reported gyro values stay raw.
+ 		auto        rate      = m_state.gyro;
+ 		const float magnitude = Length(m_state.accel);
+diff --git a/src/libs/gyroBias.h b/src/libs/gyroBias.h
+new file mode 100644
+index 00000000..b4e9396a
+--- /dev/null
++++ b/src/libs/gyroBias.h
+@@ -0,0 +1,104 @@
++#ifndef EMULATOR_INCLUDE_EMULATOR_GYRO_BIAS_H_
++#define EMULATOR_INCLUDE_EMULATOR_GYRO_BIAS_H_
++
++#include <array>
++#include <cmath>
++#include <cstdint>
++
++namespace Libs::Controller {
++
++// Zero-rate gyro offset, learned while the pad lies still, and removed from every reading.
++//
++// SDL's Switch driver reads the pad's factory zero-rate offset but never subtracts it, and nothing
++// after it does either. A genuine Pro Controller lying on a table read +5.0, -0.9, -1.9 deg/s (noise
++// 0.05 deg/s), so the game saw a constant up/down rotation.
++//
++// A sample counts as still when every gyro axis stays within GYRO_SPREAD of the window's first sample
++// and gravity stays within ACCEL_SPREAD of its first value. After WINDOW_US of still samples the window
++// mean becomes the offset, and it keeps being refreshed while the pad stays still (offsets drift with
++// temperature).
++//
++// Gravity is compared smoothed over about 50 samples (~0.25 s at 200 Hz): that cuts accelerometer noise
++// (about 0.001 G on these pads) tenfold, so ACCEL_SPREAD can be 0.01 G, about 0.6 degrees of tilt.
++// A steady tilt faster than about 0.75 deg/s then moves gravity past it within the second.
++//
++// Ceiling: a steady turn about the vertical axis slower than GYRO_SPREAD, or a steady tilt slower than
++// about 0.75 deg/s, held for a whole second, looks like rest and would be learned as offset (an error
++// below those rates, against the 5 deg/s removed). Hands are not that steady. If it ever matters, the
++// upgrade is an explicit "calibrate now" action.
++class GyroBias {
++public:
++	static constexpr float    GYRO_SPREAD  = 0.0175f; // rad/s (1 deg/s); rest noise is ~0.001 rad/s
++	static constexpr float    ACCEL_SPREAD = 0.01f;   // G; 1 degree of tilt moves gravity by 0.017 G
++	static constexpr float    ACCEL_SMOOTH = 0.02f;   // per-sample weight of the newest accelerometer reading
++	static constexpr uint32_t ACCEL_SETTLE = 50;      // samples until the smoothed gravity is trustworthy
++	static constexpr uint64_t WINDOW_US    = 1000000;
++	static constexpr uint64_t GAP_US       = 100000; // a longer pause between samples restarts the window
++
++	// gyro in rad/s, accel the latest accelerometer reading in G, time_us the sensor timestamp.
++	// Returns true when this sample completed a still window and updated the offset.
++	bool Add(const float* gyro, const std::array<float, 3>& accel, uint64_t time_us) {
++		for (int i = 0; i < 3; i++) {
++			m_accel[i] = m_accel_samples != 0 ? m_accel[i] + ACCEL_SMOOTH * (accel[i] - m_accel[i]) : accel[i];
++		}
++		// A window starts only once the smoothing has settled, so its gravity reference is not one noisy sample.
++		const bool settled = m_accel_samples >= ACCEL_SETTLE;
++		m_accel_samples += settled ? 0 : 1;
++		const bool continues = settled && m_count != 0 && time_us >= m_last_us && time_us - m_last_us <= GAP_US &&
++		                       Near(gyro, m_first_gyro.data(), GYRO_SPREAD) &&
++		                       Near(m_accel.data(), m_first_accel.data(), ACCEL_SPREAD);
++		if (!continues) {
++			m_start_us    = time_us;
++			m_first_gyro  = {gyro[0], gyro[1], gyro[2]};
++			m_first_accel = m_accel;
++			m_sum         = {0.0, 0.0, 0.0};
++			m_count       = 0;
++		}
++		for (int i = 0; i < 3; i++) {
++			m_sum[i] += gyro[i];
++		}
++		m_count++;
++		m_last_us = time_us;
++		if (time_us - m_start_us < WINDOW_US) {
++			return false;
++		}
++		for (int i = 0; i < 3; i++) {
++			m_value[i] = static_cast<float>(m_sum[i] / m_count);
++		}
++		m_valid = true;
++		m_count = 0;
++		return true;
++	}
++
++	void Apply(float* gyro) const {
++		if (m_valid) {
++			for (int i = 0; i < 3; i++) {
++				gyro[i] -= m_value[i];
++			}
++		}
++	}
++
++	[[nodiscard]] bool                        Valid() const { return m_valid; }
++	[[nodiscard]] const std::array<float, 3>& Value() const { return m_value; }
++
++private:
++	static bool Near(const float* a, const float* b, float spread) {
++		return std::fabs(a[0] - b[0]) <= spread && std::fabs(a[1] - b[1]) <= spread &&
++		       std::fabs(a[2] - b[2]) <= spread;
++	}
++
++	std::array<float, 3>  m_value {};
++	bool                  m_valid = false;
++	std::array<float, 3>  m_first_gyro {};
++	std::array<float, 3>  m_first_accel {};
++	std::array<float, 3>  m_accel {};
++	uint32_t              m_accel_samples = 0;
++	std::array<double, 3> m_sum {};
++	uint32_t              m_count    = 0;
++	uint64_t              m_start_us = 0;
++	uint64_t              m_last_us  = 0;
++};
++
++} // namespace Libs::Controller
++
++#endif /* EMULATOR_INCLUDE_EMULATOR_GYRO_BIAS_H_ */
+-- 
+2.47.1.windows.1
+

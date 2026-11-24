@@ -1,0 +1,69 @@
+From 857c32f1a80b57f8a5b8386f2ea5d00329a73f37 Mon Sep 17 00:00:00 2001
+From: Codex <local@invalid>
+Date: Fri, 20 Nov 2026 01:27:26 +0000
+Subject: [PATCH] feat(libc): read path aliases from APS5_PATH_ALIASES
+
+APS5_PATH_ALIASES=<guest prefix>=<host folder>[;...] adds path aliases when the alias table is
+created, so a launcher can map /app0/<folder> to a folder it could not link into app0 (a dump on an
+exFAT, FAT32 or network drive, where Windows refuses junctions and symbolic links need extra rights).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ core/libs/prx/libc/src/General.cpp | 33 +++++++++++++++++++++++++++++-
+ 1 file changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/core/libs/prx/libc/src/General.cpp b/core/libs/prx/libc/src/General.cpp
+index 972d2f2070..6a5e98fd9a 100644
+--- a/core/libs/prx/libc/src/General.cpp
++++ b/core/libs/prx/libc/src/General.cpp
+@@ -3,6 +3,7 @@
+ #include <atomic>
+ #include <array>
+ #include <cstdio>
++#include <cstdlib>
+ #include <mutex>
+ #include <stdexcept>
+ #include <string>
+@@ -63,8 +64,38 @@ struct PathAliases {
+     std::vector<std::pair<std::string, PathProvider>> providers;
+ };
+ 
++std::string TrimAliasSlashes(std::string_view text) {
++    std::size_t first = 0;
++    std::size_t last = text.size();
++    while (first < last && (text[first] == '/' || text[first] == '\\')) ++first;
++    while (last > first && (text[last - 1] == '/' || text[last - 1] == '\\')) --last;
++    return std::string(text.substr(first, last - first));
++}
++
++void AddEnvironmentAliases(PathAliases& aliases) {
++    const char* value = std::getenv("APS5_PATH_ALIASES");
++    if (value == nullptr) return;
++    std::string_view text(value);
++    while (!text.empty()) {
++        const auto end = text.find(';');
++        const auto item = text.substr(0, end);
++        const auto separator = item.find('=');
++        if (separator != std::string_view::npos) {
++            auto prefix = TrimAliasSlashes(item.substr(0, separator));
++            std::string host(item.substr(separator + 1));
++            if (!prefix.empty() && !host.empty()) aliases.entries.emplace_back(std::move(prefix), std::move(host));
++        }
++        if (end == std::string_view::npos) break;
++        text.remove_prefix(end + 1);
++    }
++}
++
+ PathAliases& Aliases() {
+-    static auto* aliases = new PathAliases;
++    static auto* aliases = [] {
++        auto* created = new PathAliases;
++        AddEnvironmentAliases(*created);
++        return created;
++    }();
+     return *aliases;
+ }
+ 
+-- 
+2.55.0.windows.5
+

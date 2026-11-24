@@ -1,0 +1,29 @@
+From 58281c2d3fb8db6ce3c50798f0517feb73640181 Mon Sep 17 00:00:00 2001
+From: imnotsharingmyname <imnotsharingmyname@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 22:10:50 +0000
+Subject: [PATCH] fix(audio): ignore non-empty audio paths in
+ libSceAudioPropagation (fixes Slo-Mo Casino crash)
+
+---
+ core/libs/prx/libSceAudioPropagation/Export.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/core/libs/prx/libSceAudioPropagation/Export.cpp b/core/libs/prx/libSceAudioPropagation/Export.cpp
+index 21e00c79c3..66de70a9f2 100644
+--- a/core/libs/prx/libSceAudioPropagation/Export.cpp
++++ b/core/libs/prx/libSceAudioPropagation/Export.cpp
+@@ -126,7 +126,10 @@ void requireRaysOutput(std::uint32_t* count, const char* function) {
+ }
+ 
+ void requireNoPropagation(bool none, const char* function) {
+-    if (!none) throw std::runtime_error(std::string(function) + ": rays or audio paths are outside the no-propagation model");
++    // Slo-Mo Casino (Serpent Starway / World 3) submits non-zero audio paths/rays;
++    // ignore them cleanly in the no-propagation stub instead of terminating the game.
++    static_cast<void>(none);
++    static_cast<void>(function);
+ }
+ 
+ }
+-- 
+2.55.0.windows.5
+

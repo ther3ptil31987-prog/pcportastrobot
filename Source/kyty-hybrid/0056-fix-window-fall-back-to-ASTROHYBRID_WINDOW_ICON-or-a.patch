@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AstroHybrid <noreply@localhost>
+Date: Sun, 22 Nov 2026 20:30:35 +0000
+Subject: [PATCH] fix(window): fall back to ASTROHYBRID_WINDOW_ICON or
+ app0/sce_sys/icon0.png
+
+---
+ src/graphics/presentation/window/window.cpp | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/src/graphics/presentation/window/window.cpp b/src/graphics/presentation/window/window.cpp
+index 20a35ec1..f95372cf 100644
+--- a/src/graphics/presentation/window/window.cpp
++++ b/src/graphics/presentation/window/window.cpp
+@@ -1005,6 +1005,23 @@ void WindowContext::UpdateIcon() {
+ 		if (Loader::SystemContentGetIconPath(&icon_path)) {
+ 			WindowLoadPngIcon(icon_path, &icon);
+ 		}
++		// AstroHybrid: fall back to ASTROHYBRID_WINDOW_ICON or app0/sce_sys/icon0.png when system
++		// content is not loaded by Kyty.
++		if (icon.surface == nullptr) {
++			std::error_code ec;
++			const char*     custom = std::getenv("ASTROHYBRID_WINDOW_ICON");
++			for (const std::filesystem::path candidate: {
++			         custom != nullptr && custom[0] != '\0' ? std::filesystem::u8path(custom)
++			                                                : std::filesystem::path {},
++			         std::filesystem::path("app0") / "sce_sys" / "icon0.png"}) {
++				if (!candidate.empty() && std::filesystem::exists(candidate, ec)) {
++					WindowLoadPngIcon(candidate, &icon);
++					if (icon.surface != nullptr) {
++						break;
++					}
++				}
++			}
++		}
+ 		icon_loaded = true;
+ 	}
+ 
+-- 
+2.55.0.windows.5
+

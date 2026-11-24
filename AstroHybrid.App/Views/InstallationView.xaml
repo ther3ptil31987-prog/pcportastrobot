@@ -90,41 +90,41 @@
                 <StackPanel>
                     <TextBlock Text="Actions" Style="{StaticResource SectionHeaderStyle}"/>
 
-                    <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
+                    <WrapPanel Orientation="Horizontal" Margin="0,10,0,0">
                         <Button Content="Repair Installation" Command="{Binding RepairCommand}"
-                                Style="{StaticResource SecondaryButtonStyle}" Margin="0,0,10,0"/>
+                                Style="{StaticResource SecondaryButtonStyle}" Margin="0,0,10,8"/>
                         <Button Content="Rebuild Installation" Command="{Binding RebuildCommand}"
-                                Style="{StaticResource SecondaryButtonStyle}" Margin="0,0,10,0"/>
+                                Style="{StaticResource SecondaryButtonStyle}" Margin="0,0,10,8"/>
                         <Button Content="Change Location" Command="{Binding ChangeLocationCommand}"
-                                Style="{StaticResource SecondaryButtonStyle}"/>
-                    </StackPanel>
+                                Style="{StaticResource SecondaryButtonStyle}" Margin="0,0,0,8"/>
+                    </WrapPanel>
 
-                    <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
+                    <WrapPanel Orientation="Horizontal" Margin="0,6,0,0">
                         <Button Content="Open Install Folder" Command="{Binding OpenInstallFolderCommand}"
-                                Style="{StaticResource TextButtonStyle}" Margin="0,0,10,0"/>
+                                Style="{StaticResource TextButtonStyle}" Margin="0,0,10,4"/>
                         <Button Content="Open Log Folder" Command="{Binding OpenLogFolderCommand}"
-                                Style="{StaticResource TextButtonStyle}"/>
-                    </StackPanel>
+                                Style="{StaticResource TextButtonStyle}" Margin="0,0,10,4"/>
+                        <Button Content="Export Support Logs" Command="{Binding ExportSupportLogsCommand}"
+                                Style="{StaticResource TextButtonStyle}" Margin="0,0,0,4"/>
+                    </WrapPanel>
                 </StackPanel>
             </Border>
 
             <!-- Danger Zone -->
-            <Border Style="{StaticResource CardStyle}" BorderBrush="{StaticResource ErrorBrush}">
+            <Border Style="{StaticResource CardStyle}" BorderBrush="#AAEF4444">
                 <StackPanel>
                     <TextBlock Text="⚠ Danger Zone" Style="{StaticResource SectionHeaderStyle}" Foreground="{StaticResource ErrorBrush}"/>
 
-                    <TextBlock Style="{StaticResource MutedTextStyle}" Margin="0,10,0,10" TextWrapping="Wrap">
+                    <TextBlock Style="{StaticResource MutedTextStyle}" Margin="0,10,0,12" TextWrapping="Wrap">
                         These actions are irreversible. Your original game dump will NOT be deleted.
                     </TextBlock>
 
-                    <StackPanel Orientation="Horizontal">
+                    <WrapPanel Orientation="Horizontal">
                         <Button Content="Run Setup Again" Command="{Binding RunSetupAgainCommand}"
-                                Style="{StaticResource SecondaryButtonStyle}" Margin="0,0,10,0"
-                                Background="#33AA0000" BorderBrush="#AA0000" Foreground="#FFAA00"/>
+                                Style="{StaticResource DangerButtonStyle}" Margin="0,0,10,6"/>
                         <Button Content="Uninstall AstroHybrid" Command="{Binding UninstallCommand}"
-                                Style="{StaticResource SecondaryButtonStyle}"
-                                Background="#33AA0000" BorderBrush="#AA0000" Foreground="#FFAA00"/>
-                    </StackPanel>
+                                Style="{StaticResource DangerButtonStyle}" Margin="0,0,0,6"/>
+                    </WrapPanel>
                 </StackPanel>
             </Border>
         </StackPanel>

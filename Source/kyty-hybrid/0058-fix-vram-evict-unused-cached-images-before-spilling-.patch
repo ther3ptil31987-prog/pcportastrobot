@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AstroHybrid <noreply@localhost>
+Date: Mon, 23 Nov 2026 16:54:11 +0000
+Subject: [PATCH] fix(vram): evict unused cached images before spilling images
+ to system memory
+
+---
+ src/graphics/host_gpu/vma.cpp | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/src/graphics/host_gpu/vma.cpp b/src/graphics/host_gpu/vma.cpp
+index 2e8b4480..5a20b176 100644
+--- a/src/graphics/host_gpu/vma.cpp
++++ b/src/graphics/host_gpu/vma.cpp
+@@ -540,6 +540,11 @@ bool GraphicContext::BindSparseImageLevels(VulkanImage& image, uint32_t first_le
+ 		// any memory type the image allows (system memory: slower to sample, but the game goes on).
+ 		ReleaseRetainedMemory();
+ 		result = allocate();
++		if (result != vk::Result::eSuccess && relieve_memory_pressure) {
++			if (relieve_memory_pressure(std::max<uint64_t>(64ull * 1024ull * 1024ull, bytes)) != 0) {
++				result = allocate();
++			}
++		}
+ 		if (result != vk::Result::eSuccess && ImageSystemMemoryFallbackEnabled()) {
+ 			create.requiredFlags  = 0;
+ 			create.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+@@ -906,6 +911,16 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
+ 			ClearRetiredImages();
+ 			result = allocate();
+ 		}
++		if (memory_failure(result) && relieve_memory_pressure) {
++			const uint64_t approx_bytes = std::max<uint64_t>(
++			    64ull * 1024ull * 1024ull,
++			    static_cast<uint64_t>(image_info.extent.width) * image_info.extent.height *
++			        std::max<uint32_t>(1u, image_info.extent.depth) *
++			        std::max<uint32_t>(1u, image_info.arrayLayers) * 4ull);
++			if (relieve_memory_pressure(approx_bytes) != 0) {
++				result = allocate();
++			}
++		}
+ 		if (memory_failure(result) && ImageSystemMemoryFallbackEnabled()) {
+ 			// From chenxiao07/KytyPS5 86910c0d2: out of video memory, the image goes to any memory
+ 			// type the driver allows for it (NVIDIA: system memory for optimal images). Slower to
+-- 
+2.55.0.windows.5
+

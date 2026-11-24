@@ -14,6 +14,7 @@ namespace AstroHybrid.App.Views
         public SetupWizard(string rootDirectory)
         {
             InitializeComponent();
+            ClampToWorkArea();
             _viewModel = new SetupWizardViewModel(rootDirectory);
             DataContext = _viewModel;
             _viewModel.SetupCompleted += OnSetupCompleted;
@@ -44,6 +45,15 @@ namespace AstroHybrid.App.Views
                 }
             };
             UpdatePanels();
+        }
+
+        private void ClampToWorkArea()
+        {
+            var work = SystemParameters.WorkArea;
+            MaxWidth = work.Width;
+            MaxHeight = work.Height;
+            if (Width > work.Width * 0.94) Width = Math.Max(MinWidth, work.Width * 0.90);
+            if (Height > work.Height * 0.94) Height = Math.Max(MinHeight, work.Height * 0.90);
         }
 
         private void UpdatePanels()
